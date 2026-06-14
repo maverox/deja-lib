@@ -1,0 +1,30 @@
+[workspace]
+members = [
+    "crates/deja",
+    "crates/deja-context",
+    "crates/deja-core",
+    "crates/deja-derive",
+    "crates/deja-compactor",
+    "crates/deja-record",
+    "crates/deja-tui",
+    "crates/replay-harness-kernel",
+    "crates/replay-harness-api",
+    "crates/replay-harness-store",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+version = "0.1.0"
+authors = ["Déjà contributors"]
+repository = "https://github.com/maverox/deja-lib"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"
