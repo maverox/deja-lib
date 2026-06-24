@@ -6,7 +6,7 @@
 
 ## What this is
 
-[Déjà](https://github.com/<public-deja-lib>) is a deterministic record/replay
+[Déjà](https://github.com/maverox/deja-lib) is a deterministic record/replay
 harness for service boundaries. This PR adds the **record-side integration** to
 Hyperswitch: with `--features deja` and `DEJA_MODE=record`, every storage/cache/
 crypto/id/time boundary call emits a structured `SemanticEvent`, published to

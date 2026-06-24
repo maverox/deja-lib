@@ -58,8 +58,25 @@ see the platform design on per-case isolation / parallel replay.)
 | `dropped-write` | candidate skips a fire-and-forget redis cache populate (`if false`) | **omitted-only** · redis | ≥1 omitted `set_key`, **0 novel, 0 HTTP diff** — a *silent* lost write |
 | `response-only` | overrides one response field (`amount`), no boundary call touched | **HTTP body** · http_incoming | body mismatch with **0 side-effect divergences** |
 | `extra-call` | candidate issues a `db` find V1 never made | **novel-only** · db | 1 novel, no omitted pair |
+| `eu-overcharge` | re-keys a data-driven `find_config_by_key` rate READ; the looked-up rate flows into a fire-and-forget redis `set_key` settlement WRITE | **value-diverged** · state (read→write) | **0** under AllLookup (partial derivative MASKS it); 1 `ValueDiverged` set_key under SelectiveExecute (total derivative), **0 HTTP diff** |
 
 The `dropped-write` and `response-only` cases are the important ones: a regression
 that's **invisible in the HTTP response** (a dropped side-effect) and one that's
 **invisible in the side-effects** (a wrong response value) — the gate must catch
 both, and they have cleanly opposite signatures.
+
+The `eu-overcharge` case is the **M1 total-derivative** demo. It re-keys a READ
+(`find_config_by_key`, keyed off request `currency`) whose result *flows into* a
+WRITE (a redis `serialize_and_set_key` settlement-audit populate), and the
+overcharge is **write-only and invisible in the HTTP body** (it mirrors
+`dropped-write`, not `response-only`). The contrast is the point: under the default
+`AllLookup` policy (full-mock = *partial* derivative) the re-keyed read is served
+its recorded result by call-site identity, so the diverged write never fires and the
+regression is **masked** — the same blind spot a record/replay full-mock has for
+effects that flow *through* substituted reads. Only under `SelectiveExecute{state}`
+(*total* derivative) does the real query run, the divergent rate reach the write, and
+the post-hoc tally emit a single `ValueDiverged` on the `set_key` — caught with the
+HTTP body still byte-identical. NOTE: full build + live A/B verification happens in
+the live docker matrix run; this patch is checked here for clean `git apply` and
+syntactic soundness only (rustfmt-parse clean; identical API surface to sibling
+operation files that already call `find_config_by_key` / `get_redis_conn`).

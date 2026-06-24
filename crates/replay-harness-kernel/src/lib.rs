@@ -312,6 +312,19 @@ mod tests {
             duration_us: 0,
             event_schema_version: 1,
             callsite_identity: None,
+            provenance: deja::Provenance::default(),
+            recon: deja::Recon::default(),
+            result_image: None,
+            pre_image: None,
+            read_set: Vec::new(),
+            write_set: Vec::new(),
+            value_digest: None,
+            entropy_source: None,
+            channel: None,
+            effect: None,
+            strategy: None,
+            raw_draw: None,
+            end_timestamp_ns: None,
         }
     }
 

@@ -40,15 +40,20 @@ function ScorecardSummary({ runId }: { runId: string }) {
   const v = card.data.verdict;
   const verdict = v.inconclusive ? "inconclusive" : v.pass ? "pass" : "fail";
   const conf = overallConfidence(s.resolved_by_rank ?? {});
+  const valueDivergences = s.value_divergences ?? 0;
+  const caught = valueDivergences > 0;
   return (
     <>
       <h2>Scorecard</h2>
-      <div className="scorestrip">
+      <div className={`scorestrip ${verdict === "pass" ? "clean" : "diverged"}`}>
         <span className={`chip solid ${verdict}`}>{verdict}</span>
+        {caught && <span className="chip solid fail">CAUGHT</span>}
         <ConfidenceBadge level={conf} title="overall run confidence = weakest address rank relied on" />
         <span className="lede">{v.reason}</span>
       </div>
       <div className="panel grid">
+        <div className={`metric${caught ? " hot" : ""}`}><div className="v">{valueDivergences}</div><div className="k">value divergences (total-derivative catches)</div></div>
+        <div className="metric"><div className="v">{s.inconclusive_seed_gaps ?? 0}</div><div className="k">inconclusive seed gaps</div></div>
         <div className="metric"><div className="v">{s.matched_correlations}/{s.total_correlations}</div><div className="k">correlations matched</div></div>
         <div className="metric"><div className="v">{s.http_status_mismatches}</div><div className="k">http status mismatches</div></div>
         <div className="metric"><div className="v">{s.http_body_mismatches}</div><div className="k">http body mismatches</div></div>

@@ -103,12 +103,14 @@ pub fn http(attr: TokenStream, item: TokenStream) -> TokenStream {
 pub fn time(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as instrument::InstrumentArgs);
     let func = parse_macro_input!(item as ItemFn);
-    instrument::generate_with_boundary(args, func, Some("time")).into()
+    // Preset: Channel::Entropy(EntropySource::Clock), no effect.
+    instrument::generate_with_preset(args, func, Some("time"), instrument::Preset::Time).into()
 }
 
 #[proc_macro_attribute]
 pub fn id(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as instrument::InstrumentArgs);
     let func = parse_macro_input!(item as ItemFn);
-    instrument::generate_with_boundary(args, func, Some("id")).into()
+    // Preset: Channel::Entropy(EntropySource::Id), no effect.
+    instrument::generate_with_preset(args, func, Some("id"), instrument::Preset::Id).into()
 }

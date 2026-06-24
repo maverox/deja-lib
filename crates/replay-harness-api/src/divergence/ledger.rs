@@ -83,10 +83,17 @@ pub struct CallRecord {
     pub boundary: String,
     pub trait_name: String,
     pub method_name: String,
-    /// matched | recovered | novel | omitted | environmental | deterministic
+    /// matched | recovered | novel | omitted | environmental | deterministic |
+    /// value_diverged
     pub kind: String,
     /// Whether this row counts toward the fail verdict (mirrors the scorecard).
     pub blocking: bool,
+    /// For a `value_diverged` row: `true` on the ORIGIN (the executed read whose
+    /// real-boundary value differed from the recorded baseline — the cause),
+    /// `false` on the CONSEQUENCE (a downstream write paired args-free). Absent on
+    /// every other kind. Lets the UI render the origin -> consequence cascade.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub origin: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_rank: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -111,11 +118,23 @@ fn recorded_side(ev: &SemanticEvent) -> CallSide {
 }
 
 fn observed_side(obs: &ObservedCall) -> CallSide {
+    // For a value-divergence the candidate ran the REAL boundary, so its
+    // `observed_result` IS an independent value (e.g. 0.20 vs recorded 0.10) and
+    // must be carried so the Calls tab + graph can show old -> new. For a plain
+    // (substituted) match the observed value equals the recorded result by
+    // construction, so we leave `result` to the recorded side to avoid implying
+    // an independent value.
+    let result = if obs.provenance == deja::Provenance::ExecuteShadow
+        && obs.observed_result.is_some()
+        && obs.observed_result != obs.recorded_result
+    {
+        obs.observed_result.clone()
+    } else {
+        None
+    };
     CallSide {
         args: Some(obs.args.clone()),
-        // A resolved call returns the recorded result (substituted); we leave
-        // `result` to the recorded side to avoid implying an independent value.
-        result: None,
+        result,
         is_error: None,
         call_file: obs.call_file.clone(),
         call_line: obs.call_line,
@@ -148,8 +167,135 @@ pub fn build(
     let mut rows: Vec<CallRecord> = Vec::new();
     let mut consumed: HashSet<u64> = HashSet::new();
 
+    // Args-free pairing of recorded twins for execute-mode write consequences,
+    // mirroring `detect()`: a re-keyed write misses its baseline by args, so it
+    // would otherwise split into a phantom novel (observed) + omitted (recorded
+    // twin). Pair them by call-site identity (correlation, boundary, method) in
+    // FIFO source order so the ledger shows ONE value_diverged consequence row
+    // carrying recorded 0.10 + observed 0.20 — parity with the scorecard.
+    type Identity = (Option<String>, String, String);
+    let mut recorded_pairing: HashMap<Identity, std::collections::VecDeque<u64>> = HashMap::new();
+    {
+        let mut by_identity: Vec<(Identity, u64)> = expected_seqs
+            .iter()
+            .filter_map(|s| by_seq.get(s).copied())
+            .map(|ev| {
+                (
+                    (
+                        ev.correlation_id.clone(),
+                        ev.boundary.clone(),
+                        ev.method_name.clone(),
+                    ),
+                    ev.global_sequence,
+                )
+            })
+            .collect();
+        by_identity.sort_by_key(|(_, seq)| *seq);
+        for (id, seq) in by_identity {
+            recorded_pairing.entry(id).or_default().push_back(seq);
+        }
+    }
+    // Recorded twins claimed by a value_diverged consequence, so the omitted pass
+    // doesn't also flag them (collapses the would-be novel+omitted split).
+    let mut paired_consumed: HashSet<u64> = HashSet::new();
+
     // --- observed calls (candidate side) ------------------------------------
     for obs in observed {
+        // ORIGIN: an args-aligned executed boundary (typically a READ) whose REAL
+        // result differs from the recorded baseline — the cause of a cascade.
+        let is_value_origin = obs.resolved
+            && obs.provenance == deja::Provenance::ExecuteShadow
+            && obs.observed_result.is_some()
+            && obs.recorded_result.is_some()
+            && obs.observed_result != obs.recorded_result;
+
+        if is_value_origin {
+            consumed.extend(obs.source_event_global_sequence);
+            let recorded = obs
+                .source_event_global_sequence
+                .and_then(recorded_for)
+                .and_then(CallSide::or_none);
+            rows.push(CallRecord {
+                correlation_id: obs.correlation_id.clone(),
+                source_event_global_sequence: obs.source_event_global_sequence,
+                boundary: obs.boundary.clone(),
+                trait_name: obs.trait_name.clone(),
+                method_name: obs.method_name.clone(),
+                kind: "value_diverged".to_owned(),
+                blocking: true,
+                origin: true,
+                resolved_rank: obs.resolved_rank,
+                recorded,
+                observed: observed_side(obs).or_none(),
+            });
+            continue;
+        }
+
+        // CONSEQUENCE: an unresolved execute-mode call (a re-keyed WRITE) that
+        // pairs args-free with an unconsumed recorded twin. Emit ONE
+        // value_diverged consequence row (recorded twin value + observed value)
+        // instead of a phantom novel + omitted split.
+        if !obs.resolved
+            && obs.provenance == deja::Provenance::ExecuteShadow
+            && obs.correlation_id.is_some()
+            && !is_nonblocking_boundary(&obs.boundary)
+            && tier_for(&obs.boundary) != Tier::Environmental
+        {
+            let id: Identity = (
+                obs.correlation_id.clone(),
+                obs.boundary.clone(),
+                obs.method_name.clone(),
+            );
+            let twin = recorded_pairing.get_mut(&id).and_then(|q| {
+                while let Some(seq) = q.front().copied() {
+                    if consumed.contains(&seq) {
+                        q.pop_front();
+                    } else {
+                        return q.pop_front();
+                    }
+                }
+                None
+            });
+            if let Some(twin_seq) = twin {
+                paired_consumed.insert(twin_seq);
+                let mut recorded = recorded_for(twin_seq);
+                let mut observed = observed_side(obs);
+                // A WRITE returns unit, so the divergence signal lives in its
+                // OPERAND, not its result. When both sides' result is empty,
+                // surface the diverging `value` argument as the displayed value so
+                // the cascade chip reads 0.10 -> 0.20 (the recorded twin's operand
+                // vs the executed write's operand) instead of ∅ -> ∅.
+                let is_unit = |r: &Option<serde_json::Value>| {
+                    matches!(r, None | Some(serde_json::Value::Null))
+                };
+                let recorded_unit = recorded.as_ref().is_none_or(|s| is_unit(&s.result));
+                if recorded_unit && is_unit(&observed.result) {
+                    if let Some(v) = obs.args.get("value").cloned() {
+                        observed.result = Some(v);
+                    }
+                    if let Some(side) = recorded.as_mut() {
+                        if let Some(v) = side.args.as_ref().and_then(|a| a.get("value")).cloned() {
+                            side.result = Some(v);
+                        }
+                    }
+                }
+                rows.push(CallRecord {
+                    correlation_id: obs.correlation_id.clone(),
+                    source_event_global_sequence: Some(twin_seq),
+                    boundary: obs.boundary.clone(),
+                    trait_name: obs.trait_name.clone(),
+                    method_name: obs.method_name.clone(),
+                    kind: "value_diverged".to_owned(),
+                    blocking: true,
+                    origin: false,
+                    resolved_rank: obs.resolved_rank,
+                    recorded,
+                    observed: observed.or_none(),
+                });
+                continue;
+            }
+        }
+
         let (kind, blocking) = if obs.resolved {
             consumed.extend(obs.source_event_global_sequence);
             let recovered = obs.resolved_rank == Some(POSITIONAL_FALLBACK_RANK);
@@ -176,6 +322,7 @@ pub fn build(
             method_name: obs.method_name.clone(),
             kind: kind.to_owned(),
             blocking,
+            origin: false,
             resolved_rank: obs.resolved_rank,
             recorded,
             observed: observed_side(obs).or_none(),
@@ -185,7 +332,7 @@ pub fn build(
     // --- omitted: expected (table-covered) recorded events never consumed ----
     let mut omitted: Vec<&SemanticEvent> = expected_seqs
         .iter()
-        .filter(|s| !consumed.contains(s))
+        .filter(|s| !consumed.contains(s) && !paired_consumed.contains(s))
         .filter_map(|s| by_seq.get(s).copied())
         .collect();
     omitted.sort_by_key(|e| e.global_sequence);
@@ -199,6 +346,7 @@ pub fn build(
             method_name: ev.method_name.clone(),
             kind: "omitted".to_owned(),
             blocking,
+            origin: false,
             resolved_rank: None,
             recorded: recorded_for(ev.global_sequence),
             observed: None,
@@ -263,6 +411,19 @@ mod tests {
             duration_us: 0,
             event_schema_version: 1,
             callsite_identity: None,
+            provenance: deja::Provenance::default(),
+            recon: deja::Recon::default(),
+            result_image: None,
+            pre_image: None,
+            read_set: Vec::new(),
+            write_set: Vec::new(),
+            value_digest: None,
+            entropy_source: None,
+            channel: None,
+            effect: None,
+            strategy: None,
+            raw_draw: None,
+            end_timestamp_ns: None,
         }
     }
 
@@ -289,6 +450,12 @@ mod tests {
             graph_node_id: Some(42),
             synthesized: false,
             real_impl_will_fail: false,
+            recorded_result: None,
+            observed_result: None,
+            provenance: deja::Provenance::default(),
+            seed_gap: false,
+            pre_image: None,
+            result_image: None,
         }
     }
 

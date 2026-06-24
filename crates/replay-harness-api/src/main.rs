@@ -195,7 +195,12 @@ async fn v1_create_run(
     // Store row + audit BEFORE the worker spawns (stage rows FK the run row).
     let ctx = if let Some(store) = &st.store {
         let candidate = serde_json::to_value(&run.spec.candidate_spec).unwrap_or_default();
-        let params = serde_json::json!({ "workload": run.spec.workload });
+        let params = serde_json::json!({
+            "workload": run.spec.workload,
+            // Persist the replay execution policy so the dashboard can show which
+            // mode each run used (AllLookup vs SelectiveExecute) + pair A/B siblings.
+            "deja_policy": run.spec.deja_policy,
+        });
         if let Err(e) = store
             .insert_run(
                 &run.run_id,

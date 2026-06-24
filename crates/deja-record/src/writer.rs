@@ -29,18 +29,24 @@ const FATAL_CONSECUTIVE_SINK_ERRORS: u32 = 8;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SinkPolicy {
     /// No-drop backpressure: the producing thread blocks until the writer
-    /// catches up (the default — recording is the point of the demo rig).
+    /// catches up. **Opt-in only** (`DEJA_SINK_POLICY=block`) — for offline/demo
+    /// rigs where a byte-exact fixture matters more than latency. Never use in a
+    /// request-serving process: a slow sink would stall real requests, breaking
+    /// the shadow guarantee.
     Block,
-    /// Never stall request threads: drop the record, count it, and remember
-    /// its sequence range for the `dropped` sink marker.
+    /// Never stall request threads: drop the record, count it, and remember its
+    /// sequence range for the `dropped` sink marker. **The default** — recording
+    /// is a shadow, so backpressure drops events rather than blocking the request.
     FailOpen,
 }
 
 impl SinkPolicy {
     pub fn from_env() -> Self {
         match std::env::var(DEJA_SINK_POLICY_ENV_VAR).as_deref() {
-            Ok("fail_open") => SinkPolicy::FailOpen,
-            _ => SinkPolicy::Block,
+            // Explicit opt-in to no-drop backpressure (offline/demo fidelity).
+            Ok("block") => SinkPolicy::Block,
+            // Default (unset or "fail_open"): never block the request thread.
+            _ => SinkPolicy::FailOpen,
         }
     }
 }
@@ -82,7 +88,7 @@ impl Default for WriterConfig {
             batch_size: DEFAULT_BATCH_SIZE,
             flush_interval: Duration::from_millis(DEFAULT_FLUSH_INTERVAL_MS),
             flush_after_records: None,
-            policy: SinkPolicy::Block,
+            policy: SinkPolicy::FailOpen,
         }
     }
 }

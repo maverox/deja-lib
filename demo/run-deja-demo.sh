@@ -33,11 +33,18 @@ VENDOR="vendor/hyperswitch-deja-clean"
 # `--expect-divergence` / `--expect-pass`.
 EXPECT_DIVERGENCE=0
 EXPECT_SET=0
+# Replay policy for the M1 A/B contrast. Default AllLookup = today's full mock
+# (PARTIAL derivative); SelectiveExecute runs the real {db} side (TOTAL derivative).
+# With no --policy the behavior is BYTE-IDENTICAL to before (no_regression). The
+# matrix driver (run-deja-matrix.sh) is the place to run BOTH back-to-back; this
+# single-shot demo runs ONE policy and stamps the scorecard with it.
+POLICY="${DEJA_POLICY:-AllLookup}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --iterations) ITERATIONS="$2"; shift 2 ;;
     --keep) KEEP=1; shift ;;
     --candidate-patch) CANDIDATE_PATCH="$2"; shift 2 ;;
+    --policy) POLICY="$2"; shift 2 ;;
     --cross-version)
       CANDIDATE_PATCH="demo/cross-version/$2.patch"
       case "$2" in *real*) [ "$EXPECT_SET" -eq 0 ] && EXPECT_DIVERGENCE=1 ;; esac
@@ -47,6 +54,7 @@ while [ $# -gt 0 ]; do
     *) echo "unknown arg: $1"; exit 2 ;;
   esac
 done
+export DEJA_POLICY="$POLICY"
 if [ -n "$CANDIDATE_PATCH" ]; then
   if [ ! -f "$CANDIDATE_PATCH" ]; then
     echo "candidate patch not found: $CANDIDATE_PATCH"; exit 2
@@ -105,11 +113,15 @@ if [ -n "$CANDIDATE_PATCH" ]; then
   rebuild_router_v2 "candidate"
 fi
 
-echo "── REPLAY: pull from MinIO, byte-exact compare ──"
+echo "── REPLAY: pull from MinIO, byte-exact compare (DEJA_POLICY=${POLICY}, mode=$(policy_to_mode "$POLICY")) ──"
 REP_RUN=$(post_run "$(jq -nc --arg r "$REC_ID" --argjson c "$candidate" \
-  '{mode:"replay", candidate_spec:$c, recording_id:$r}')")
+  '{mode:"replay", candidate_spec:$c, recording_id:$r}')" "" "$POLICY")
 [ "$(poll "$REP_RUN")" = "completed" ] || { echo "REPLAY run failed — $(run_url "$REP_RUN")"; curl -fsS "${API}/api/v1/runs/${REP_RUN}" | jq .; exit 1; }
 echo "   replay run: $(run_url "$REP_RUN")  ·  scorecard: ${API}/api/v1/runs/${REP_RUN}/scorecard"
+
+# MINIMAL mode-provenance: stamp the policy/mode into the scorecard JSON so the
+# report self-identifies which mode produced the verdict (not just shell state).
+stamp_scorecard_mode "$REP_RUN" "$POLICY" "$(policy_to_mode "$POLICY")"
 
 CARD=$(curl -fsS "${API}/api/v1/runs/${REP_RUN}/scorecard")
 PASS=$(echo "$CARD" | jq -r .verdict.pass)

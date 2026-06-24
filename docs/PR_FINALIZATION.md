@@ -1,7 +1,30 @@
 # Upstream PR finalization — deja-lean → juspay/hyperswitch (DRAFT)
 
-What's prepared (local, nothing pushed) and the exact push-time steps. The PR
-goes **directly to `juspay/hyperswitch` upstream, as a DRAFT**, and depends on a
+## ✅ EXECUTED (2026-06-15)
+
+- **deja-lib published PUBLIC** with clean single-commit history:
+  https://github.com/maverox/deja-lib — commit
+  `a605192ffad17c556017b85f18ca75f1b6a0694e` (the git-dep `rev`). The old
+  private history was force-replaced; commit re-authored to the account's
+  GitHub noreply email (`29498864+maverox@users.noreply.github.com`) to clear
+  GitHub's email-privacy push guard.
+- **git-dep pinned** on `deja-pr`: all 7 instrumented crates' `Cargo.toml`
+  swapped path → `git = "…/deja-lib", rev = "a605192…"`; `Cargo.lock` updated
+  (5 deja crates now git-sourced). Resolution verified via `cargo metadata`.
+- **Draft PR open:** https://github.com/juspay/hyperswitch/pull/12754 —
+  base `main` ← head `maverox:deja-pr`, 48 files / +2911−220, 4 commits, all
+  authored `Uzair Khan <29498864+maverox@users.noreply.github.com>`.
+- Local dev unchanged: vendor checked back out on `deja-lean` (path dep);
+  `deja-pr` + `backup/*` branches preserved.
+
+**Still the user's to do:** rotate the Stripe test key (the now-public repo
+briefly carried old history before the force-replace; the key lived only in
+untracked state, but rotate regardless). Sampling hook = follow-up PR.
+
+---
+
+What was prepared (local) and the exact push-time steps. The PR went
+**directly to `juspay/hyperswitch` upstream, as a DRAFT**, and depends on a
 **public** `deja-lib` (a private repo is not fetchable by reviewers/CI, so the
 git dependency would not resolve).
 

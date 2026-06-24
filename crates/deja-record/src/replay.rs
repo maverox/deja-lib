@@ -14,8 +14,8 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    correlation_matches, read_events, CallsiteIdentity, CallsiteSource, DejaHook, ReplayLookup,
-    SemanticEvent,
+    correlation_matches, read_events, BoundarySpec, CallsiteIdentity, CallsiteSource, Channel,
+    DejaHook, Effect, ExecuteMode, Policy, ReplayLookup, SemanticEvent, Strategy,
 };
 
 // ---------------------------------------------------------------------------
@@ -38,7 +38,12 @@ pub struct Divergence {
 }
 
 /// Classification of a replay divergence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Note: not `Copy` because [`ValueDiverged`](DivergenceKind::ValueDiverged) and
+/// [`InconclusiveSeedGap`](DivergenceKind::InconclusiveSeedGap) carry owned
+/// payloads (recorded vs observed values, callsite). The unit variants are
+/// unaffected; comparisons still use `==`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DivergenceKind {
     /// Arguments differ from the recorded baseline at the same position.
@@ -58,6 +63,34 @@ pub enum DivergenceKind {
     /// NOT advanced and the call falls through to the real implementation
     /// (or a graceful synthesis) instead of silently lying.
     ArgSkipBlocked,
+    /// The candidate ran the REAL boundary (execute mode) and produced a result
+    /// that differs in VALUE from the recorded baseline at the same args-free
+    /// call-site + occurrence. This is the total-derivative signal: a recorded
+    /// WRITE (Omitted) and the execute WRITE (Novel) are paired by args-free
+    /// identity into ONE divergence, since the diverging value (e.g. a doubled
+    /// amount) changes the args and would otherwise split them. `args_hash` is
+    /// used here as a DIFF signal, not a resolution key.
+    ValueDiverged {
+        /// The recorded baseline value for this call-site.
+        recorded: serde_json::Value,
+        /// The value the real boundary produced under execute mode.
+        observed: serde_json::Value,
+        /// Args-free call-site identity the two sides were paired on
+        /// (`boundary::trait::method`).
+        callsite: String,
+        /// Occurrence index within the correlation scope used for pairing.
+        occurrence: u32,
+    },
+    /// The candidate's execute-mode call could not be conclusively classified
+    /// because the recorded baseline it needed to compare against was absent — a
+    /// seed gap. Surfaced explicitly so a missing baseline is not silently
+    /// counted as a match (false negative) nor as a divergence (false positive).
+    InconclusiveSeedGap {
+        /// Args-free call-site identity (`boundary::trait::method`).
+        callsite: String,
+        /// Occurrence index within the correlation scope.
+        occurrence: u32,
+    },
 }
 
 /// Accumulated replay report for one session.
@@ -790,6 +823,41 @@ pub struct ObservedCall {
     /// false in V1.
     #[serde(default)]
     pub real_impl_will_fail: bool,
+    /// The result the recording carried for this call-site (substituted under
+    /// lookup mode). Under lookup this equals `observed_result`, so a value diff
+    /// is inert; under execute mode it is the recorded baseline to compare the
+    /// real boundary's fresh result against.
+    #[serde(default)]
+    pub recorded_result: Option<serde_json::Value>,
+    /// The result actually produced for this call. Under lookup this is the
+    /// substituted (== recorded) value; under execute mode it is the REAL
+    /// boundary's fresh result. The post-hoc tally classifies
+    /// [`ValueDiverged`](crate::DivergenceKind::ValueDiverged) when these differ.
+    #[serde(default)]
+    pub observed_result: Option<serde_json::Value>,
+    /// How this observed call was served: ordinary recorded substitution, or an
+    /// execute-shadow dispatch that ran the real boundary.
+    #[serde(default)]
+    pub provenance: crate::Provenance,
+    /// Set when the call could not be conclusively classified because the
+    /// recorded baseline needed to compare against was missing (a seed gap) —
+    /// surfaced as [`InconclusiveSeedGap`](crate::DivergenceKind::InconclusiveSeedGap)
+    /// rather than a false positive. Always false in M1 lookup mode.
+    #[serde(default)]
+    pub seed_gap: bool,
+    /// Pre-image of the affected State key captured by the execute-shadow probe
+    /// BEFORE the real boundary ran (the `execute_shadow_peek` half). `None`
+    /// under lookup mode or when no [`StateProbe`] is installed. Makes the
+    /// `pre_image` real for single-op RMW total-derivative diff without touching
+    /// `SemanticEvent` (deliverable 6). Carried transparently across the
+    /// `ExecuteShadowToken`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_image: Option<serde_json::Value>,
+    /// Post-image of the affected State key captured by the execute-shadow probe
+    /// AFTER the real boundary ran (the `execute_shadow_observe` half). `None`
+    /// under lookup mode or when no [`StateProbe`] is installed (deliverable 6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_image: Option<serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -801,6 +869,219 @@ pub struct ObservedCall {
 // numbering) every lookup would silently miss. So the canonical logic lives
 // here, in `deja-record`, and both sides call it.
 // ---------------------------------------------------------------------------
+
+/// Whether a boundary tag belongs to the State channel (db / redis).
+///
+/// State is the only channel that opts into execute-mode under
+/// [`Policy::SelectiveExecute`] — Entropy and Egress stay in lookup mode. The db
+/// boundary appears under two tags: `"storage"` (the trait-delegate path) and
+/// `"db"` (the generic `QuerySpec`/`record_query` seam, which hardcodes
+/// `boundary = "db"`). `"redis"` is the cache boundary. Egress (`"http_client"`,
+/// `"grpc"`) and entropy boundaries (`"id"`, `"time"`) return `false`, so they
+/// stay lookup-substituted (entropy is reconstructed by substitution, egress is
+/// never re-executed) — only State executes against seeded/reconstructed stores.
+pub fn is_state_channel(boundary: &str) -> bool {
+    matches!(boundary, "storage" | "redis" | "db")
+}
+
+/// Whether a boundary method is a READ (as opposed to a write/unknown op).
+///
+/// Conservative by construction: a method is a read iff its name — OR its final
+/// `_`-delimited segment — starts with a known read verb; writes and any
+/// unrecognized op return `false`. The trailing-segment check makes
+/// component-prefixed operation names (e.g. `eu_settlement_read`) classify by
+/// their verb suffix while plain names (`find_payment_intent_by_id`) still match
+/// on the whole string. This gates the arg-tolerant fallback so that ONLY reads
+/// can be served their recorded value on re-keyed args — a changed WRITE never
+/// becomes arg-tolerant and stays strict (so it is still caught as a
+/// divergence). The verbs cover the db (`find_*`, `get_*`, `list_*`) and redis
+/// (`get`, `exists`, `hget`, `hexists`, `scan`, `mget`, `lookup`) read surfaces.
+pub fn is_read_op(method: &str) -> bool {
+    const READ_PREFIXES: &[&str] = &[
+        "find", "get", "exists", "scan", "fetch", "list", "hget", "hexists",
+        "lookup", "read", "load", "mget",
+    ];
+    let starts_with_verb = |s: &str| READ_PREFIXES.iter().any(|p| s.starts_with(p));
+    // Whole name, or the trailing `_`-segment (the verb suffix). Writes — whose
+    // suffix is `write`/`set`/`insert`/`update`/... — never match either way.
+    starts_with_verb(method)
+        || method.rsplit('_').next().map(starts_with_verb).unwrap_or(false)
+}
+
+/// Whether an event lives on the State channel, PREFERRING its declared
+/// [`SemanticEvent::channel`] and falling back to the [`is_state_channel`] name
+/// heuristic when the event is UNDECLARED (`channel == None`).
+///
+/// DECLARATIVE PREFERENCE: a declared event reads its own channel (the db seam +
+/// any migrated redis wrapper). FALLBACK: an undeclared event (the current vendor)
+/// is classified byte-identically to before this slice. This consumes the
+/// declaration-driven `read_set`/`write_set` that `EventBuilder::finish` now stamps.
+fn event_is_state(event: &SemanticEvent) -> bool {
+    match &event.channel {
+        Some(channel) => *channel == Channel::State,
+        None => is_state_channel(&event.boundary),
+    }
+}
+
+/// Whether an event is a READ, PREFERRING its declared [`SemanticEvent::effect`]
+/// (`Read` → read) and falling back to the [`is_read_op`] name heuristic when the
+/// event declares NO effect (`effect == None`).
+///
+/// DECLARATIVE PREFERENCE: a declared State event reads its own effect (Read vs
+/// Write/RMW/...). FALLBACK: an undeclared event uses the verb heuristic, so its
+/// read/write verdict is byte-identical to before this slice. Note the db seam
+/// declares an effect equal to the `is_read_op` verdict, so it agrees either way.
+fn event_is_read(event: &SemanticEvent) -> bool {
+    match event.effect {
+        Some(effect) => effect == Effect::Read,
+        None => is_read_op(&event.method_name),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The decision matrix (declarative boundary model, foundation slice)
+//
+// `decide_strategy` is the WHOLE runtime decision for a DECLARED boundary: a
+// pure table over (Channel × Effect × Policy) plus a per-op strategy override.
+// It implements the matrix in `docs/design/declarative-boundary-model.md` §2.
+//
+// ADDITIVE FALLBACK: when `channel` is UNDECLARED (`None`) the matrix cannot key
+// a declared cell, so it returns [`Strategy::Lookup`] — the safe-by-construction
+// default (an undeclared boundary can never wrongly execute). The runtime entry
+// point [`boundary_execute_mode_for`] routes an undeclared boundary to the hook's
+// EXISTING string-heuristic [`DejaHook::execute_mode`] instead, so an unmigrated
+// boundary's runtime decision is byte-identical to before this slice (proven by
+// the fallback test).
+// ---------------------------------------------------------------------------
+
+/// Map a resolved [`Strategy`] to the runtime [`ExecuteMode`] the existing
+/// dispatch path understands. `Lookup` serves the recorded value
+/// ([`ExecuteMode::Lookup`]); `SeedAndExecute` runs the real boundary
+/// ([`ExecuteMode::Execute`]).
+///
+/// `LookupAndSeed` is STUBBED in this slice: the live "serve recorded return +
+/// seed post-state" mechanism needs a post-state seeding step that is not wired
+/// for the boundary dispatch path yet, so it maps to the SAFE
+/// [`ExecuteMode::Lookup`] (serve recorded, never double-apply) — see the
+/// `TODO(vendor-migration)` below. This only ever affects an explicitly DECLARED
+/// boundary; the undeclared path never reaches it.
+pub fn strategy_to_execute_mode(strategy: Strategy) -> ExecuteMode {
+    match strategy {
+        Strategy::Lookup => ExecuteMode::Lookup,
+        Strategy::SeedAndExecute => ExecuteMode::Execute,
+        // TODO(vendor-migration): wire the live "serve recorded return + seed
+        // post-state" mechanism (needs a StateProbe-backed post-state seed on the
+        // boundary dispatch path; `InMemoryStateProbe`/`StateProbe` exist for the
+        // execute-shadow image capture but the LookupAndSeed serve-and-seed step
+        // is not yet plumbed through `dispatch`). Until then resolve to a SAFE
+        // Lookup so a declared Append/RMW-LookupAndSeed boundary serves its
+        // recorded value and never double-applies. NOTE in the report.
+        Strategy::LookupAndSeed => ExecuteMode::Lookup,
+        // Forward-compat: an unknown strategy from a newer tape is never executed.
+        Strategy::Unknown => ExecuteMode::Lookup,
+    }
+}
+
+/// The pure decision matrix for a DECLARED boundary (declarative boundary model
+/// §2). Given the declared [`Channel`] and (State-only) [`Effect`], an optional
+/// per-op [`Strategy`] override, and the active [`Policy`], return the
+/// [`Strategy`] the runtime should use.
+///
+/// CRITICAL FALLBACK: when `channel` is `None` (UNDECLARED — every current vendor
+/// wrapper) this returns [`Strategy::Lookup`]. That is the safe default (an
+/// undeclared boundary can never wrongly execute); the runtime entry point
+/// [`boundary_execute_mode_for`] additionally routes undeclared boundaries to the
+/// hook's existing string heuristics so their decision is byte-identical to
+/// before this slice.
+///
+/// Matrix (declared cells):
+/// - Channel::Entropy(_) / Egress (any) → Lookup
+/// - Channel::State + Effect::Read|Write → Lookup (AllLookup);
+///   SeedAndExecute (SelectiveExecute)
+/// - Channel::State + Effect::Append → Lookup (AllLookup);
+///   LookupAndSeed (SelectiveExecute)
+/// - Channel::State + Effect::ReadModifyWrite → Lookup (AllLookup);
+///   under SelectiveExecute the per-op `strategy_override` decides (REQUIRED for
+///   RMW; the macro enforces it). Absent (defensive) → Lookup.
+/// - Channel::State + Effect::VolatileRead → Lookup (never executed — TTL-decay /
+///   non-deterministic iteration is not reproducible)
+/// - Channel::State + Effect::Opaque → Lookup (EVAL; opt-in via override only)
+/// - Channel::State + effect None → Lookup (conservative)
+pub fn decide_strategy(
+    channel: Option<Channel>,
+    effect: Option<Effect>,
+    strategy_override: Option<Strategy>,
+    policy: Policy,
+) -> Strategy {
+    // A per-op override always wins within an executing State cell (lets any
+    // declared boundary be tuned). It is REQUIRED for RMW under SelectiveExecute.
+
+    // UNDECLARED channel → safe default. `boundary_execute_mode_for` reroutes
+    // these to the heuristic path; the pure matrix itself never executes an
+    // undeclared cell.
+    let Some(channel) = channel else {
+        return Strategy::Lookup;
+    };
+
+    match (channel, policy) {
+        // Entropy(_) / Egress: never executed or re-issued — Lookup under every
+        // policy (no effect is declared on these channels).
+        (Channel::Entropy(_), _) | (Channel::Egress, _) => Strategy::Lookup,
+
+        // Forward-compat: an unknown channel from a newer tape is never executed.
+        (Channel::Unknown, _) => Strategy::Lookup,
+
+        // State: every cell is Lookup under AllLookup (the demo-green default).
+        (Channel::State, Policy::AllLookup) => Strategy::Lookup,
+
+        // State under SelectiveExecute: the effect decides.
+        (Channel::State, Policy::SelectiveExecute) => match effect {
+            // The canonical execute cell.
+            Some(Effect::Read) | Some(Effect::Write) => {
+                strategy_override.unwrap_or(Strategy::SeedAndExecute)
+            }
+            // Append (XADD): serve the recorded id and seed the entry (never
+            // double-append) — LookupAndSeed — unless overridden.
+            Some(Effect::Append) => strategy_override.unwrap_or(Strategy::LookupAndSeed),
+            // ReadModifyWrite: the per-op override is REQUIRED (the macro enforces
+            // it). Defensive fall-back to Lookup if somehow absent.
+            Some(Effect::ReadModifyWrite) => strategy_override.unwrap_or(Strategy::Lookup),
+            // VolatileRead: never execute — a time-decaying value / non-deterministic
+            // iteration is not reproducible (it would diverge every run).
+            Some(Effect::VolatileRead) => Strategy::Lookup,
+            // Opaque (EVAL): opt-in-only via an explicit override.
+            Some(Effect::Opaque) => strategy_override.unwrap_or(Strategy::Lookup),
+            // Forward-compat: an unknown effect from a newer tape is never executed.
+            Some(Effect::Unknown) => Strategy::Lookup,
+            // effect None on State → conservative Lookup.
+            None => Strategy::Lookup,
+        },
+    }
+}
+
+/// Runtime entry point for the boundary-macro execute-mode decision under a
+/// concrete hook. Routes a DECLARED boundary through the pure matrix
+/// ([`decide_strategy`]) mapped to an [`ExecuteMode`]; routes an UNDECLARED
+/// boundary to the hook's EXISTING string-heuristic [`DejaHook::execute_mode`],
+/// so an unmigrated boundary's decision is byte-identical to before this slice.
+///
+/// The hook supplies the active [`Policy`] via [`DejaHook::replay_policy`] (the
+/// default trait impl reports [`Policy::AllLookup`], so a hook that does not
+/// track a policy decides exactly as before).
+pub fn boundary_execute_mode_for(hook: &dyn DejaHook, spec: &BoundarySpec) -> ExecuteMode {
+    let semantics = spec.semantics();
+    if semantics.is_undeclared() {
+        // FALLBACK: the unmigrated path. Identical to the pre-slice decision.
+        return hook.execute_mode(spec.boundary, spec.trait_name, spec.method_name);
+    }
+    let strategy = decide_strategy(
+        semantics.channel,
+        semantics.effect,
+        semantics.strategy,
+        hook.replay_policy(),
+    );
+    strategy_to_execute_mode(strategy)
+}
 
 /// Stable, order-independent hash of a call's serialized args.
 ///
@@ -1107,6 +1388,34 @@ pub struct LookupTableHook {
     /// (occurrence-0) call at each callsite would resolve.
     callsite_occurrence: Mutex<crate::CallsiteOccurrenceMap>,
     observed_sink: Box<dyn ObservedCallSink>,
+    /// Replay policy for this hook, parsed once from `DEJA_POLICY`. Defaults to
+    /// [`Policy::AllLookup`] (full mock) — under which [`Self::execute_mode`]
+    /// always returns [`ExecuteMode::Lookup`] and the hook is byte-identical to
+    /// before this field existed.
+    policy: crate::Policy,
+    /// Args-free secondary index: `(correlation_id, address, occurrence) ->
+    /// LookupEntry`. Built alongside `table` so an arg-tolerant fallback can
+    /// resolve a RE-KEYED read (one whose args changed since recording) by
+    /// call-site identity + occurrence with args ignored. Only consulted on a
+    /// strict-args miss under [`Policy::SelectiveExecute`], so the default
+    /// [`Policy::AllLookup`] path never sees it (preserving the partial-derivative
+    /// contrast where a re-keyed read makes AllLookup MISS).
+    argless_index: HashMap<(Option<String>, Address, u32), LookupEntry>,
+    /// Op-scope for execute mode, parsed once from `DEJA_EXECUTE_OPS`
+    /// (comma-separated operation/method names). When EMPTY, every State-channel
+    /// boundary executes under [`Policy::SelectiveExecute`] (the original
+    /// behavior). When NON-EMPTY, only State-channel boundaries whose
+    /// `method_name` is in the set execute; all others fall back to Lookup. This
+    /// lets the demo execute ONLY the settlement read/write ops while every other
+    /// State boundary stays in lookup mode.
+    execute_ops: std::collections::HashSet<String>,
+    /// Optional probe of the live State store, used by the execute-shadow path to
+    /// capture `pre_image` (before the real op) and `result_image` (after) for
+    /// single-op RMW total-derivative diff (deliverable 6). `None` (the default)
+    /// makes the hook byte-identical to before this field existed — no probing,
+    /// no extra reads. A real probe needs the running container (the harness owns
+    /// that); tests install an [`InMemoryStateProbe`].
+    state_probe: Option<Box<dyn StateProbe>>,
 }
 
 impl LookupTableHook {
@@ -1114,14 +1423,55 @@ impl LookupTableHook {
     /// and any `ObservedCallSink` (typically `InMemoryObservedSink` for tests
     /// or `FileObservedSink` for harness runs). Loading happens once at
     /// construction; failures bubble up as `io::Error`.
-    pub fn from_source<S, K>(mut source: S, sink: K) -> std::io::Result<Self>
+    ///
+    /// Uses the default [`Policy::AllLookup`] (full mock). Callers that want the
+    /// `DEJA_POLICY`-driven policy use [`Self::from_source_with_policy`].
+    pub fn from_source<S, K>(source: S, sink: K) -> std::io::Result<Self>
+    where
+        S: LookupTableSource,
+        K: ObservedCallSink + 'static,
+    {
+        // Empty execute-op scope: under SelectiveExecute every State boundary
+        // executes (the original behavior); under AllLookup it is unused.
+        Self::from_source_with_policy(
+            source,
+            sink,
+            crate::Policy::default(),
+            std::collections::HashSet::new(),
+        )
+    }
+
+    /// Construct like [`Self::from_source`] but with an explicit replay
+    /// [`Policy`]. Under [`Policy::SelectiveExecute`] the hook runs the REAL
+    /// State (db/redis) boundary during replay and falls back to arg-tolerant
+    /// substitution for re-keyed reads; under [`Policy::AllLookup`] (the default)
+    /// it behaves exactly as before.
+    pub fn from_source_with_policy<S, K>(
+        mut source: S,
+        sink: K,
+        policy: crate::Policy,
+        execute_ops: std::collections::HashSet<String>,
+    ) -> std::io::Result<Self>
     where
         S: LookupTableSource,
         K: ObservedCallSink + 'static,
     {
         let table = source.load()?;
         let mut map = HashMap::with_capacity(table.entries.len());
+        let mut argless_index: HashMap<(Option<String>, Address, u32), LookupEntry> =
+            HashMap::with_capacity(table.entries.len());
         for entry in table.entries {
+            // Args-free key: drop `args_hash` so a re-keyed read can still resolve
+            // by call-site identity + occurrence. First write wins per
+            // (correlation, address, occurrence) — distinct args at the SAME
+            // address+occurrence are a recording anomaly; keeping the first is
+            // deterministic and matches the strongest-rank-first lookup order.
+            let argless_key = (
+                entry.key.correlation_id.clone(),
+                entry.key.address.clone(),
+                entry.key.occurrence,
+            );
+            argless_index.entry(argless_key).or_insert_with(|| entry.clone());
             map.insert(entry.key.clone(), entry);
         }
         Ok(Self {
@@ -1131,7 +1481,26 @@ impl LookupTableHook {
             global_counter: std::sync::atomic::AtomicU64::new(0),
             callsite_occurrence: Mutex::new(HashMap::new()),
             observed_sink: Box::new(sink),
+            policy,
+            argless_index,
+            execute_ops,
+            state_probe: None,
         })
+    }
+
+    /// Install a [`StateProbe`] for execute-shadow RMW image capture
+    /// (deliverable 6). With a probe set, the execute path captures `pre_image`
+    /// before the real op and `result_image` after, stamping both onto the shadow
+    /// [`ObservedCall`]. Without one (the default) nothing is probed and the hook
+    /// behaves exactly as before. Returns `self` for chaining at construction.
+    pub fn with_state_probe(mut self, probe: Box<dyn StateProbe>) -> Self {
+        self.state_probe = Some(probe);
+        self
+    }
+
+    /// The replay policy this hook was constructed with.
+    pub fn policy(&self) -> crate::Policy {
+        self.policy
     }
 
     /// Number of entries loaded. Useful for assertions.
@@ -1156,14 +1525,19 @@ impl LookupTableHook {
             0
         }
     }
-}
 
-impl DejaHook for LookupTableHook {
-    fn is_active(&self) -> bool {
-        true
-    }
-
-    fn try_replay_with_context(&self, query: ReplayLookup<'_>) -> Option<serde_json::Value> {
+    /// Resolve one replay call to its recorded baseline.
+    ///
+    /// SINGLE source of truth shared by [`Self::try_replay_with_context`]
+    /// (lookup) and [`Self::execute_shadow_peek`] (execute): it bumps the
+    /// per-correlation request sequence, stamps occurrences for EVERY rank, and
+    /// queries the table strongest-first (with the `SelectiveExecute`
+    /// arg-tolerant fallback). Because BOTH modes route through here, the
+    /// stamper / sequence counters advance EXACTLY ONCE per call regardless of
+    /// mode, so numbering never drifts between a lookup boundary and an execute
+    /// boundary in the same run. It does NOT emit an observation — the caller
+    /// shapes and emits the `ObservedCall` (Recorded vs ExecuteShadow).
+    fn resolve(&self, query: &ReplayLookup<'_>) -> Resolution {
         // The candidate carries no notion of "current correlation" in
         // ReplayLookup; pull it from the ambient deja-context scope set up
         // by the request middleware.
@@ -1199,32 +1573,182 @@ impl DejaHook for LookupTableHook {
             }
         }
 
+        // ARG-TOLERANT FALLBACK (partial derivative), READS-ONLY. When the
+        // strict-args lookup misses AND the call is a READ op, fall back to an
+        // args-FREE match on call-site identity + occurrence (args LAST): serve
+        // the RECORDED result this call-site produced even though the args were
+        // re-keyed since the recording. This is what lets a re-keyed READ resolve
+        // to its recorded value — the partial-derivative substitution that masks
+        // transitive effects flowing through it. It is GATED on `is_read_op` so
+        // ONLY reads can take it (a changed WRITE never becomes arg-tolerant and
+        // stays strict, so it is still caught as a divergence — no regression).
+        // It applies under BOTH policies: under AllLookup a re-keyed READ now
+        // serves the recorded value (a clean MISS for the demo), while every
+        // existing fixture — which has no re-keyed reads — resolves strictly and
+        // behaves byte-identically.
+        if hit.is_none() && is_read_op(query.method_name) {
+            for key in &keys {
+                let argless_key = (
+                    key.correlation_id.clone(),
+                    key.address.clone(),
+                    key.occurrence,
+                );
+                if let Some(entry) = self.argless_index.get(&argless_key) {
+                    hit = Some((entry, key.address.rank()));
+                    break;
+                }
+            }
+        }
+
         // "Where" for the diff UI + graph placement. `location` is already
         // resolved above (rank-5 SourceLocation); the span path is the rank-2
         // logical address; the graph node is the replay-side execution-graph
         // node this call fired under.
         let (_, graph_node_id) = crate::current_execution_graph_context();
-        self.observed_sink.observed(ObservedCall {
+        Resolution {
             correlation_id,
+            location: location.map(|(f, l, c)| (f.to_owned(), l, c)),
+            graph_node_id,
+            resolved_rank: hit.map(|(_, rank)| rank),
+            source_event_global_sequence: hit.map(|(entry, _)| entry.source_event_global_sequence),
+            recorded_result: hit.map(|(entry, _)| entry.result.clone()),
+        }
+    }
+}
+
+/// Outcome of [`LookupTableHook::resolve`]: the recorded baseline for one call
+/// plus the call-site metadata both modes carry into their `ObservedCall`.
+struct Resolution {
+    correlation_id: Option<String>,
+    location: Option<(String, u32, u32)>,
+    graph_node_id: Option<u64>,
+    resolved_rank: Option<u8>,
+    source_event_global_sequence: Option<u64>,
+    recorded_result: Option<serde_json::Value>,
+}
+
+impl Resolution {
+    /// The recorded baseline value, if the call resolved.
+    fn recorded_result(&self) -> Option<serde_json::Value> {
+        self.recorded_result.clone()
+    }
+
+    /// Shape an [`ObservedCall`] from this resolution, the originating query, the
+    /// `observed_result` for this mode (the substituted recorded value under
+    /// lookup, or `None`/the-real-result under execute), and the `provenance`.
+    fn into_observed_call(
+        self,
+        query: &ReplayLookup<'_>,
+        observed_result: Option<serde_json::Value>,
+        provenance: crate::Provenance,
+    ) -> ObservedCall {
+        ObservedCall {
+            correlation_id: self.correlation_id,
             boundary: query.boundary.to_owned(),
             trait_name: query.trait_name.to_owned(),
             method_name: query.method_name.to_owned(),
             args: query.args.clone(),
-            resolved: hit.is_some(),
-            resolved_rank: hit.map(|(_, rank)| rank),
-            source_event_global_sequence: hit.map(|(entry, _)| entry.source_event_global_sequence),
-            call_file: location.map(|(f, _, _)| f.to_owned()),
-            call_line: location.map(|(_, l, _)| l),
-            call_column: location.map(|(_, _, c)| c),
+            resolved: self.recorded_result.is_some(),
+            resolved_rank: self.resolved_rank,
+            source_event_global_sequence: self.source_event_global_sequence,
+            call_file: self.location.as_ref().map(|(f, _, _)| f.clone()),
+            call_line: self.location.as_ref().map(|(_, l, _)| *l),
+            call_column: self.location.as_ref().map(|(_, _, c)| *c),
             logical_span_path: crate::current_logical_span_path(),
-            graph_node_id,
+            graph_node_id: self.graph_node_id,
             // V1 full mock never synthesizes and never relies on the real impl;
             // these stay false until the V2 tiered-miss work lands.
             synthesized: false,
             real_impl_will_fail: false,
-        });
+            recorded_result: self.recorded_result,
+            observed_result,
+            provenance,
+            seed_gap: false,
+            // Filled by the execute-shadow probe when a StateProbe is installed
+            // (see `LookupTableHook::execute_shadow_peek`/`observe`).
+            pre_image: None,
+            result_image: None,
+        }
+    }
+}
 
-        hit.map(|(entry, _)| entry.result.clone())
+impl DejaHook for LookupTableHook {
+    fn is_active(&self) -> bool {
+        true
+    }
+
+    fn try_replay_with_context(&self, query: ReplayLookup<'_>) -> Option<serde_json::Value> {
+        // Resolve the recorded baseline (advancing the stamper / sequence
+        // counters EXACTLY ONCE, shared with the execute path so numbering never
+        // drifts between lookup and execute boundaries), then emit a `Recorded`
+        // observation: under lookup mode the observed result IS the substituted
+        // recorded result, so the two sides are identical and ValueDiverged is
+        // inert.
+        let resolution = self.resolve(&query);
+        let recorded = resolution.recorded_result();
+        self.observed_sink.observed(resolution.into_observed_call(
+            &query,
+            // Lookup mode: observed == recorded (the substituted value).
+            recorded.clone(),
+            crate::Provenance::Recorded,
+        ));
+        recorded
+    }
+
+    fn execute_shadow_peek(
+        &self,
+        query: ReplayLookup<'_>,
+    ) -> Option<crate::ExecuteShadowToken> {
+        // First half of an execute-mode dispatch. Resolve the recorded baseline
+        // through the SAME path the lookup uses (so the stamper / sequence /
+        // occurrence counters advance identically — a run mixing lookup and
+        // execute boundaries keeps aligned numbering), but do NOT substitute and
+        // do NOT emit yet. Build the shadow observation with `observed_result =
+        // None`; the macro fills it after the real boundary call and hands the
+        // token back to `execute_shadow_observe`.
+        let resolution = self.resolve(&query);
+        let mut observed = resolution.into_observed_call(
+            &query,
+            // Filled in by `execute_shadow_observe` from the real result.
+            None,
+            crate::Provenance::ExecuteShadow,
+        );
+        // `seed_gap` marks "ran the real boundary but there is no recorded
+        // baseline to compare against" — surfaced by the tally as
+        // InconclusiveSeedGap rather than a false match/divergence.
+        observed.seed_gap = observed.recorded_result.is_none();
+        // Deliverable 6: when a StateProbe is installed, capture the pre-image of
+        // the affected key BEFORE the real op runs. Carried on the ObservedCall
+        // (and thus transparently across the opaque ExecuteShadowToken) so
+        // `execute_shadow_observe` can attach the post-image.
+        if let Some(probe) = self.state_probe.as_deref() {
+            if let Some(key) = primary_state_key(query.args) {
+                observed.pre_image = probe.probe(query.boundary, &key);
+            }
+        }
+        Some(crate::ExecuteShadowToken::new(observed))
+    }
+
+    fn execute_shadow_observe(
+        &self,
+        token: crate::ExecuteShadowToken,
+        observed_result: serde_json::Value,
+    ) {
+        // Second half: stamp the real boundary's result onto the carried
+        // observation and emit it. The post-hoc tally pairs this ExecuteShadow
+        // observation against the recorded baseline by args-free identity +
+        // occurrence and classifies ValueDiverged on a value diff.
+        let mut observed = token.into_observed(observed_result);
+        // Deliverable 6: capture the post-image AFTER the real op ran, from the
+        // same key the pre-image was probed for (re-derived from the carried
+        // args). The pre/post pair is what a single-op RMW total-derivative diff
+        // needs.
+        if let Some(probe) = self.state_probe.as_deref() {
+            if let Some(key) = primary_state_key(&observed.args) {
+                observed.result_image = probe.probe(&observed.boundary, &key);
+            }
+        }
+        self.observed_sink.observed(observed);
     }
 
     fn try_replay(
@@ -1244,6 +1768,42 @@ impl DejaHook for LookupTableHook {
             callsite_identity: None,
             caller_location: None,
         })
+    }
+
+    fn replay_policy(&self) -> crate::Policy {
+        // Report this hook's parsed policy so the declarative decision matrix
+        // (`boundary_execute_mode_for`) keys the right column for a DECLARED
+        // boundary. UNDECLARED boundaries never consult this — they route through
+        // `execute_mode` below — so this changes no unmigrated decision.
+        self.policy
+    }
+
+    fn execute_mode(
+        &self,
+        boundary: &str,
+        _trait_name: &str,
+        method_name: &str,
+    ) -> crate::ExecuteMode {
+        // Only the State channel (db / redis) opts into running the REAL boundary
+        // during replay, and only under SelectiveExecute. Everything else — and
+        // the entire AllLookup path — stays in Lookup mode, so a run with no
+        // DEJA_POLICY set returns Lookup for every call and is byte-identical to
+        // before this method existed.
+        //
+        // OP-SCOPING: when `execute_ops` is non-empty, only State boundaries whose
+        // `method_name` is in the set execute; every other State boundary falls
+        // back to Lookup. An EMPTY set means "all State executes" (the original
+        // behavior). This lets the demo execute ONLY the settlement ops.
+        match self.policy {
+            crate::Policy::SelectiveExecute if is_state_channel(boundary) => {
+                if self.execute_ops.is_empty() || self.execute_ops.contains(method_name) {
+                    crate::ExecuteMode::Execute
+                } else {
+                    crate::ExecuteMode::Lookup
+                }
+            }
+            _ => crate::ExecuteMode::Lookup,
+        }
     }
 
     fn record(&self, _event: SemanticEvent) {
@@ -1296,6 +1856,546 @@ impl DejaHook for LookupTableHook {
     }
 }
 
+// ===========================================================================
+// Total-derivative SEEDING pipeline (PURE, replay-side)
+//
+// A boundary crossing is `imp(x) ≡ pur(x, h)`. Replay re-runs the real `pur`
+// and must supply the handler `h` as preconditions: the State (db/redis) keys a
+// correlation READ must already hold the recorded value before the candidate
+// re-executes, or a re-run read either misses (false divergence) or reads stale
+// (silent lie). The functions below DERIVE those preconditions from a recording
+// — they read only `&[SemanticEvent]` and produce plain data, so they are fully
+// unit-testable without docker. Materialization into a live store is a separate,
+// thin wiring step (see `replay-harness-api` lifecycle) that walks a `SeedPlan`.
+//
+// Design source: docs/design/recording-capture-decoupled.md §2.D, §5, §7.1.
+// All inputs come off the tape; nothing here re-interprets args/result bytes or
+// touches `canonical_args_hash` — it only JOINS already-captured fields.
+// ===========================================================================
+
+/// One precondition to materialize before a correlation is re-executed: the
+/// State `boundary`/`key` must hold `value`. Derived from the recorded read-set
+/// of every State READ in the correlation (deliverable 1) and/or merged from an
+/// ambient template (deliverable 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeedEntry {
+    /// State channel this key lives on (`"redis"` / `"storage"`).
+    pub boundary: String,
+    /// The state key (from the recorded `read_set`).
+    pub key: String,
+    /// The recorded value the key held when the correlation read it.
+    pub value: serde_json::Value,
+    /// How this entry entered the plan: derived from the recording's read-set,
+    /// or supplied by the ambient/config template.
+    pub origin: SeedOrigin,
+}
+
+/// Where a [`SeedEntry`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SeedOrigin {
+    /// Reconstructed from a recorded State READ's `read_set` + `result`.
+    #[default]
+    Recording,
+    /// Supplied by the static ambient/config template (deliverable 4).
+    Ambient,
+}
+
+/// The set of `(boundary, key, value)` preconditions to materialize for a
+/// correlation before re-execution, keyed by `(boundary, key)` so a later
+/// read-set occurrence (or an ambient default) resolves deterministically.
+///
+/// Built by [`build_seed_plan`] (deliverable 1) over a recording's events,
+/// optionally pre-loaded with an [`AmbientTemplate`] (deliverable 4). Consult it
+/// with [`Self::resolve`] / [`Self::classify_read`] (deliverable 3) to decide
+/// whether a candidate's diverged read is reconstructable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeedPlan {
+    /// `(boundary, key) -> entry`. A BTreeMap keeps materialization order stable
+    /// (so a `redis-cli SET` sequence is deterministic across runs).
+    entries: BTreeMap<(String, String), SeedEntry>,
+}
+
+impl SeedPlan {
+    /// An empty plan.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert (or overwrite) one precondition. Recording-derived entries take
+    /// precedence over ambient defaults for the SAME key (so a key actually
+    /// observed in the recording is seeded with what the recording saw, not the
+    /// template default); ambient never clobbers a recording entry.
+    pub fn upsert(&mut self, entry: SeedEntry) {
+        let k = (entry.boundary.clone(), entry.key.clone());
+        match self.entries.get(&k) {
+            // Recording always wins over Ambient; Recording-over-Recording keeps
+            // the FIRST recorded value within the correlation (the precondition
+            // the correlation observed before it began mutating the key).
+            Some(existing)
+                if existing.origin == SeedOrigin::Recording
+                    && entry.origin == SeedOrigin::Ambient => {}
+            Some(existing) if existing.origin == SeedOrigin::Recording => {}
+            _ => {
+                self.entries.insert(k, entry);
+            }
+        }
+    }
+
+    /// Number of preconditions in the plan.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the plan is empty.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Resolve the seeded value for a `(boundary, key)`, if the plan has one.
+    pub fn resolve(&self, boundary: &str, key: &str) -> Option<&SeedEntry> {
+        self.entries
+            .get(&(boundary.to_owned(), key.to_owned()))
+    }
+
+    /// Whether the plan (recording-derived OR ambient) covers this key.
+    pub fn contains(&self, boundary: &str, key: &str) -> bool {
+        self.resolve(boundary, key).is_some()
+    }
+
+    /// Iterate the preconditions in deterministic `(boundary, key)` order — the
+    /// materialization order the harness shells into the store.
+    pub fn iter(&self) -> impl Iterator<Item = &SeedEntry> {
+        self.entries.values()
+    }
+
+    /// Merge an [`AmbientTemplate`] into this plan (deliverable 4). Ambient
+    /// entries fill keys the recording never observed (e.g. a config rate a
+    /// re-keyed read reaches for); they never overwrite a recording-derived
+    /// precondition. Returns `self` for chaining.
+    pub fn with_ambient(mut self, template: &AmbientTemplate) -> Self {
+        for entry in template.entries() {
+            self.upsert(entry.clone());
+        }
+        self
+    }
+
+    /// Classify a candidate's observed read against this plan (deliverable 3).
+    /// See [`ReadClassification`]. NEVER returns `Reconstructable` for a key the
+    /// plan does not cover — a key the recording never observed and the template
+    /// does not define is a seed-gap, surfaced rather than served stale.
+    pub fn classify_read(&self, boundary: &str, key: &str) -> ReadClassification {
+        match self.resolve(boundary, key) {
+            Some(entry) => ReadClassification::Reconstructable {
+                value: entry.value.clone(),
+                origin: entry.origin,
+            },
+            None => ReadClassification::NotReconstructable {
+                boundary: boundary.to_owned(),
+                key: key.to_owned(),
+            },
+        }
+    }
+}
+
+/// Verdict for a candidate's diverged read of a State key (deliverable 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadClassification {
+    /// The key is in the seed plan (recording-derived or ambient): the read can
+    /// be reconstructed from `value`. `origin` distinguishes a real recorded
+    /// precondition from an ambient/config default.
+    Reconstructable {
+        value: serde_json::Value,
+        origin: SeedOrigin,
+    },
+    /// The key is NOT in the plan AND NOT in the ambient template — a seed-gap.
+    /// The harness must surface this (it maps to
+    /// [`DivergenceKind::InconclusiveSeedGap`]) rather than silently serving a
+    /// stale value for a key the recording never observed.
+    NotReconstructable { boundary: String, key: String },
+}
+
+impl ReadClassification {
+    /// Whether the read can be reconstructed (plan or template covers the key).
+    pub fn is_reconstructable(&self) -> bool {
+        matches!(self, ReadClassification::Reconstructable { .. })
+    }
+}
+
+/// Build a [`SeedPlan`] from a recording's events for ONE correlation
+/// (deliverable 1). Walks every State READ in `correlation_id`'s slice and, for
+/// each key in its recorded `read_set`, records the value the read returned —
+/// the precondition the key must hold for the candidate to re-read it.
+///
+/// PURE: reads only `&[SemanticEvent]`, allocates plain data, performs no I/O.
+/// The FIRST recorded read of a key within the correlation wins (its value is
+/// the precondition that existed before the correlation began mutating it); a
+/// later read of the same key after a write reflects the mutation, not the
+/// precondition, so it must not overwrite the seed.
+///
+/// `correlation_id == None` selects events with no correlation (mirrors
+/// [`correlation_matches`]), so a single-case tape still builds a plan.
+/// Whether a recorded read `result` represents a MISS (no value present), which
+/// must NOT be seeded. Redis serializes a nil GET as the string `"Null"`; db/json
+/// boundaries use JSON `null`. Seeding a miss writes a key the record run never
+/// held, so the re-executed read would find a phantom value and diverge.
+fn is_miss_result(result: &serde_json::Value) -> bool {
+    result.is_null() || matches!(result, serde_json::Value::String(s) if s == "Null")
+}
+
+pub fn build_seed_plan(events: &[SemanticEvent], correlation_id: Option<&str>) -> SeedPlan {
+    let mut plan = SeedPlan::new();
+    // A key is "pristine" until the correlation first WRITES it; only reads
+    // before the first write to a key describe the precondition.
+    let mut written: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for event in events {
+        if !correlation_matches(event, correlation_id) {
+            continue;
+        }
+        // DECLARATIVE PREFERENCE: gate on the declared channel (fallback to the
+        // `is_state_channel` heuristic for undeclared events).
+        if !event_is_state(event) {
+            continue;
+        }
+        // Mark writes so a post-write read of the same key never seeds the
+        // (now-mutated) value as a precondition.
+        for key in &event.write_set {
+            written.insert((event.boundary.clone(), key.clone()));
+        }
+        // Only READ events describe a precondition; the recorded `result` is the
+        // value the key held. Skip error reads — a failed read has no value to
+        // seed and must not masquerade as a precondition.
+        if event.is_error {
+            continue;
+        }
+        // DECLARATIVE PREFERENCE: only READ events describe a precondition; read
+        // off the declared effect (fallback to the `is_read_op` heuristic).
+        if event_is_read(event) {
+            // Skip MISS reads: a key absent at record time must STAY absent in the
+            // seed, or the re-executed read finds a phantom value and diverges. A
+            // redis miss serializes as the string "Null" (the nil sentinel); a db
+            // miss as JSON null. Seeding either would write a key the record run
+            // never had (the 18 spurious redis get_key/delete_key value-divergences).
+            // Now keyed off the READ verdict (declared `Effect::Read`, fallback
+            // `is_read_op`): a non-read event never reaches the miss guard, which is
+            // behavior-identical (the miss guard only ever fed the read-seed loop).
+            if is_miss_result(&event.result) {
+                continue;
+            }
+            for key in &event.read_set {
+                let k = (event.boundary.clone(), key.clone());
+                if written.contains(&k) {
+                    // The correlation already wrote this key before this read;
+                    // the value reflects the mutation, not the precondition.
+                    continue;
+                }
+                plan.upsert(SeedEntry {
+                    boundary: event.boundary.clone(),
+                    key: key.clone(),
+                    value: event.result.clone(),
+                    origin: SeedOrigin::Recording,
+                });
+            }
+        }
+    }
+    plan
+}
+
+/// Recover the `pre_image` of every State WRITE by JOINING to the most-recent
+/// prior READ of the same key within the correlation (deliverable 2).
+///
+/// PURE join over an event slice: for each WRITE event, the pre-image is the
+/// `result` of the latest preceding READ whose `read_set` overlaps the write's
+/// `write_set` (the read/write-set overlap on the same key). Returns one
+/// [`PreImageJoin`] per write that resolved a pre-image; writes with no prior
+/// read of the key are omitted (their pre-image is genuinely unknown from the
+/// tape — a live probe is needed, deliverable 6).
+///
+/// Does not mutate the events; the caller may stamp `SemanticEvent::pre_image`
+/// from the result (the recording side leaves `pre_image = None`, so this makes
+/// it real for analysis without re-recording).
+pub fn join_pre_images(
+    events: &[SemanticEvent],
+    correlation_id: Option<&str>,
+) -> Vec<PreImageJoin> {
+    let mut joins = Vec::new();
+    // Most-recent read value per (boundary, key) seen SO FAR in order.
+    let mut last_read: HashMap<(String, String), serde_json::Value> = HashMap::new();
+    for (idx, event) in events.iter().enumerate() {
+        if !correlation_matches(event, correlation_id) {
+            continue;
+        }
+        // DECLARATIVE PREFERENCE: gate on the declared channel (fallback to the
+        // `is_state_channel` heuristic for undeclared events).
+        if !event_is_state(event) {
+            continue;
+        }
+        // DECLARATIVE PREFERENCE: read off the declared effect (Read → read_set,
+        // Write/RMW → write_set); fallback to the `is_read_op` heuristic.
+        let is_read = event_is_read(event);
+        if is_read && !event.is_error {
+            for key in &event.read_set {
+                last_read.insert(
+                    (event.boundary.clone(), key.clone()),
+                    event.result.clone(),
+                );
+            }
+        }
+        // A WRITE recovers its pre-image from the most-recent prior read of the
+        // SAME key (read_set/write_set overlap). After recovering, the write's
+        // own result becomes the new "current" value for any subsequent write.
+        if !is_read {
+            for key in &event.write_set {
+                let k = (event.boundary.clone(), key.clone());
+                if let Some(prior) = last_read.get(&k) {
+                    joins.push(PreImageJoin {
+                        write_global_sequence: event.global_sequence,
+                        write_event_index: idx,
+                        boundary: event.boundary.clone(),
+                        key: key.clone(),
+                        pre_image: prior.clone(),
+                    });
+                }
+                // The write's result is the key's post-image; a later write or
+                // read-after-write joins to it.
+                if !event.is_error {
+                    last_read.insert(k, event.result.clone());
+                }
+            }
+        }
+    }
+    joins
+}
+
+/// One recovered pre-image: a State WRITE joined to the most-recent prior READ
+/// of the same key within the correlation (deliverable 2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreImageJoin {
+    /// `global_sequence` of the write event the pre-image belongs to.
+    pub write_global_sequence: u64,
+    /// Index of the write within the input slice (stable join handle).
+    pub write_event_index: usize,
+    /// State channel the key lives on.
+    pub boundary: String,
+    /// The mutated key.
+    pub key: String,
+    /// The value the key held immediately before the write (the prior read's
+    /// recorded `result`).
+    pub pre_image: serde_json::Value,
+}
+
+// ---------------------------------------------------------------------------
+// Ambient template (deliverable 4) — static config/ambient state
+// ---------------------------------------------------------------------------
+
+/// A static template of ambient/config State that is NOT part of any one
+/// recording's observed read-set but that a re-keyed / diverged read may reach
+/// for (e.g. `settlement_rate_premium`). Merged into a [`SeedPlan`] via
+/// [`SeedPlan::with_ambient`] so such reads resolve from the template rather
+/// than being flagged as seed-gaps.
+///
+/// The default ([`AmbientTemplate::demo_defaults`]) carries the EU-settlement
+/// demo's premium rate, replacing the hand-coded `redis-cli SET
+/// settlement_rate_premium 0.20` in the lifecycle driver.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AmbientTemplate {
+    /// Ambient entries, each an `Ambient`-origin precondition.
+    entries: Vec<SeedEntry>,
+}
+
+impl AmbientTemplate {
+    /// An empty template.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register an ambient `(boundary, key, value)`. Stamped `SeedOrigin::Ambient`.
+    pub fn insert(
+        &mut self,
+        boundary: impl Into<String>,
+        key: impl Into<String>,
+        value: serde_json::Value,
+    ) {
+        self.entries.push(SeedEntry {
+            boundary: boundary.into(),
+            key: key.into(),
+            value,
+            origin: SeedOrigin::Ambient,
+        });
+    }
+
+    /// The ambient entries.
+    pub fn entries(&self) -> &[SeedEntry] {
+        &self.entries
+    }
+
+    /// Whether the template defines anything.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Parse a template from simple `boundary\tkey\tvalue` lines (one per line,
+    /// `#`-comments and blanks ignored). `value` is parsed as JSON if it is
+    /// valid JSON, else treated as a JSON string — so `0.20` becomes a number
+    /// and `usd` becomes `"usd"`. Lets the demo's ambient config live in a file
+    /// (deliverable 4) instead of being hard-coded.
+    pub fn from_tsv(text: &str) -> Self {
+        let mut template = Self::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut cols = line.splitn(3, '\t');
+            let (Some(boundary), Some(key), Some(raw)) =
+                (cols.next(), cols.next(), cols.next())
+            else {
+                continue;
+            };
+            let value = serde_json::from_str::<serde_json::Value>(raw.trim())
+                .unwrap_or_else(|_| serde_json::Value::String(raw.trim().to_owned()));
+            template.insert(boundary.trim(), key.trim(), value);
+        }
+        template
+    }
+
+    /// The EU-settlement demo's ambient defaults. The premium rate is the value
+    /// a re-keyed settlement read reaches for under SelectiveExecute; sourcing it
+    /// here (instead of a hand-coded `redis-cli SET`) is deliverable 4. The
+    /// value is stored raw as it would sit in redis (a string `"0.20"`), so the
+    /// materializer writes byte-identical bytes to the old literal seed.
+    pub fn demo_defaults() -> Self {
+        let mut template = Self::new();
+        // The premium settlement rate the divergent (re-keyed) read observes.
+        // Was a hand-coded `redis-cli SET settlement_rate_premium 0.20`.
+        template.insert(
+            "redis",
+            "settlement_rate_premium",
+            serde_json::Value::String("0.20".to_owned()),
+        );
+        template
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StateProbe (deliverable 6) — pre/post images for single-op RMW
+// ---------------------------------------------------------------------------
+
+/// Best-effort extraction of the primary State key from a live call's args, for
+/// the execute-shadow probe. Mirrors the recorder's `extract_primary_state_key`
+/// (the leading string scalar in argument order is the common key shape) so the
+/// probe targets the same key the recording's `read_set`/`write_set` named. A
+/// HINT, never authoritative.
+pub(crate) fn primary_state_key(args: &serde_json::Value) -> Option<String> {
+    fn first_string(v: &serde_json::Value) -> Option<String> {
+        match v {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Array(a) => a.iter().find_map(first_string),
+            serde_json::Value::Object(m) => m.values().find_map(first_string),
+            _ => None,
+        }
+    }
+    first_string(args)
+}
+
+/// Abstraction over reading a single State key's current value from the live
+/// replay store, used by the execute-shadow path to capture `pre_image` (before
+/// the real op) and `result_image` (after). Decouples the probe mechanism (a
+/// live `redis-cli GET`, a db SELECT, or an in-memory fake) from the hook, so
+/// the RMW image capture is unit-testable without docker (deliverable 6).
+///
+/// A real live probe needs the running container (docker), so the production
+/// impl lives in the harness; here we define the seam plus an in-memory fake the
+/// hook tests exercise. The hook calls `probe(boundary, key)` immediately before
+/// the real boundary runs (→ `pre_image`) and immediately after (→
+/// `result_image`).
+pub trait StateProbe: Send + Sync {
+    /// Read the current value of `key` on `boundary`, or `None` if absent.
+    fn probe(&self, boundary: &str, key: &str) -> Option<serde_json::Value>;
+}
+
+/// An in-memory [`StateProbe`] for tests: a shared `(boundary, key) -> value`
+/// map, plus a mutation hook so a test can simulate the real op changing the
+/// store between the pre- and post-probe (the RMW the execute path observes).
+///
+/// The store is `Arc`-shared, so a [`Clone`] of the probe observes the same
+/// state — a test can install one clone in the hook and keep another to mutate
+/// the store between peek and observe (modelling the real op's write).
+#[derive(Debug, Default, Clone)]
+pub struct InMemoryStateProbe {
+    store: std::sync::Arc<Mutex<BTreeMap<(String, String), serde_json::Value>>>,
+}
+
+impl InMemoryStateProbe {
+    /// Build from initial `(boundary, key, value)` triples.
+    pub fn new(
+        initial: impl IntoIterator<Item = (String, String, serde_json::Value)>,
+    ) -> Self {
+        let store = initial
+            .into_iter()
+            .map(|(b, k, v)| ((b, k), v))
+            .collect();
+        Self {
+            store: std::sync::Arc::new(Mutex::new(store)),
+        }
+    }
+
+    /// Simulate the real op writing `key` (lets a test model an RMW between the
+    /// pre- and post-probe).
+    pub fn set(&self, boundary: &str, key: &str, value: serde_json::Value) {
+        if let Ok(mut store) = self.store.lock() {
+            store.insert((boundary.to_owned(), key.to_owned()), value);
+        }
+    }
+}
+
+impl StateProbe for InMemoryStateProbe {
+    fn probe(&self, boundary: &str, key: &str) -> Option<serde_json::Value> {
+        self.store
+            .lock()
+            .ok()
+            .and_then(|s| s.get(&(boundary.to_owned(), key.to_owned())).cloned())
+    }
+}
+
+/// The pre/post images captured around a single-op RMW execute-shadow dispatch
+/// (deliverable 6). Built by [`probe_rmw_images`] from a [`StateProbe`]; the
+/// caller stamps them onto the shadow `ObservedCall` / event so total-derivative
+/// diff sees what the real op changed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RmwImages {
+    /// Value of the key BEFORE the real op (probe at peek). `None` if absent.
+    pub pre_image: Option<serde_json::Value>,
+    /// Value of the key AFTER the real op (probe at observe). `None` if absent.
+    pub result_image: Option<serde_json::Value>,
+}
+
+/// Capture the pre-image of a key via a [`StateProbe`] (call BEFORE the real op
+/// runs — the `execute_shadow_peek` half). Returns the half-built [`RmwImages`]
+/// to be completed by [`complete_rmw_images`] after the op (deliverable 6).
+pub fn probe_rmw_images(
+    probe: &dyn StateProbe,
+    boundary: &str,
+    key: &str,
+) -> RmwImages {
+    RmwImages {
+        pre_image: probe.probe(boundary, key),
+        result_image: None,
+    }
+}
+
+/// Complete the [`RmwImages`] by probing the post-image (call AFTER the real op
+/// runs — the `execute_shadow_observe` half) (deliverable 6).
+pub fn complete_rmw_images(
+    mut images: RmwImages,
+    probe: &dyn StateProbe,
+    boundary: &str,
+    key: &str,
+) -> RmwImages {
+    images.result_image = probe.probe(boundary, key);
+    images
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1337,6 +2437,19 @@ mod tests {
             duration_us: 100,
             event_schema_version: 1,
             callsite_identity: None,
+            provenance: crate::Provenance::default(),
+            recon: crate::Recon::default(),
+            result_image: None,
+            pre_image: None,
+            read_set: Vec::new(),
+            write_set: Vec::new(),
+            value_digest: None,
+            entropy_source: None,
+            channel: None,
+            effect: None,
+            strategy: None,
+            raw_draw: None,
+            end_timestamp_ns: None,
         }
     }
 
@@ -1521,7 +2634,7 @@ mod tests {
             report
                 .divergences
                 .iter()
-                .map(|d| d.kind)
+                .map(|d| d.kind.clone())
                 .collect::<Vec<_>>()
         );
     }
@@ -1672,10 +2785,16 @@ mod tests {
             call(serde_json::json!({ "id": 1 })),
             Some(serde_json::json!("alpha"))
         );
+        // A NOVEL-arg READ at this existing call-site no longer misses: the
+        // reads-only arg-tolerant fallback (now policy-independent) serves the
+        // recorded value for this call-site + occurrence with args ignored. The
+        // novel `id:3` is a new args_hash bucket → occurrence 0, so the argless
+        // index returns the first occurrence-0 entry recorded here ("alpha").
+        // (A WRITE would still MISS — the fallback is reads-only.)
         assert_eq!(
             call(serde_json::json!({ "id": 3 })),
-            None,
-            "unknown args have no recorded entry"
+            Some(serde_json::json!("alpha")),
+            "a re-keyed READ resolves arg-tolerantly to the occurrence-0 recorded value"
         );
 
         let calls = handle.lock().unwrap().clone();
@@ -1687,8 +2806,10 @@ mod tests {
         );
         assert_eq!(calls[0].source_event_global_sequence, Some(9));
         assert_eq!(calls[1].source_event_global_sequence, Some(7));
-        assert!(!calls[2].resolved);
-        assert_eq!(calls[2].resolved_rank, None);
+        // call 3 (novel-arg READ) now resolves via the reads-only arg-tolerant
+        // fallback, at the explicit-address rank (1) of the occurrence-0 entry.
+        assert!(calls[2].resolved);
+        assert_eq!(calls[2].resolved_rank, Some(1));
         assert_eq!(
             calls[0].boundary, "redis",
             "boundary carried on the observation"
@@ -2375,5 +3496,1174 @@ mod tests {
         });
         assert_eq!(value, Some(serde_json::json!("by_explicit")));
         assert_eq!(handle.lock().unwrap()[0].resolved_rank, Some(1));
+    }
+
+    // -----------------------------------------------------------------------
+    // Policy + arg-tolerant lookup (M1 partial-vs-total contrast)
+    // -----------------------------------------------------------------------
+
+    /// `is_read_op` classifies reads (whole name OR verb suffix) and never
+    /// classifies a write — the no-regression invariant for the reads-only
+    /// arg-tolerant fallback.
+    #[test]
+    fn is_read_op_reads_true_writes_false() {
+        // Plain read names (whole-string verb).
+        for m in [
+            "find_payment_intent_by_id",
+            "get_key",
+            "exists",
+            "get_hash_field",
+        ] {
+            assert!(is_read_op(m), "{m} must be a read");
+        }
+        // Component-prefixed read (verb suffix).
+        assert!(is_read_op("eu_settlement_read"), "verb-suffix read");
+        // Writes / unknown stay false (never arg-tolerant).
+        for m in [
+            "eu_settlement_write",
+            "set_key",
+            "serialize_and_set_key",
+            "delete_key",
+            "insert_payment_intent",
+            "update_config",
+            "set_hash_field_if_not_exist",
+        ] {
+            assert!(!is_read_op(m), "{m} must NOT be a read");
+        }
+    }
+
+    /// A re-keyed READ (its args changed since recording) under the DEFAULT
+    /// `AllLookup` policy now resolves via the arg-tolerant fallback to the
+    /// RECORDED value. The fallback is READS-ONLY and policy-independent, so
+    /// AllLookup serves the recorded value on a re-keyed read — a clean MISS for
+    /// the demo (the served value equals the recorded, so no divergence).
+    #[test]
+    fn all_lookup_serves_rekeyed_read_arg_tolerantly() {
+        let recorded_args = serde_json::json!({ "id": "pi_recorded" });
+        let table = LookupTable {
+            recording_id: "rec-1".to_owned(),
+            policy_version: 1,
+            entries: vec![entry_with(
+                None,
+                explicit("find_pi"),
+                &recorded_args,
+                0,
+                serde_json::json!({ "Ok": "row_recorded" }),
+                1,
+            )],
+        };
+        let observed = InMemoryObservedSink::new();
+        let handle = observed.handle();
+        // Default policy == AllLookup.
+        let hook = LookupTableHook::from_source(VecSource(Some(table)), observed).expect("hook");
+        assert_eq!(hook.policy(), crate::Policy::AllLookup);
+
+        // Candidate calls the SAME call-site with DIFFERENT (re-keyed) args.
+        let rekeyed_args = serde_json::json!({ "id": "pi_doubled" });
+        let identity = explicit_identity("find_pi");
+        let value = hook.try_replay_with_context(ReplayLookup {
+            boundary: "storage",
+            trait_name: "PaymentIntentInterface",
+            method_name: "find_payment_intent_by_id",
+            args: &rekeyed_args,
+            callsite_identity: Some(&identity),
+            caller_location: None,
+        });
+        assert_eq!(
+            value,
+            Some(serde_json::json!({ "Ok": "row_recorded" })),
+            "AllLookup must serve the recorded value on a re-keyed READ (reads-only fallback)"
+        );
+        assert!(handle.lock().unwrap()[0].resolved);
+    }
+
+    /// NO-REGRESSION: a re-keyed WRITE (a non-read op) under AllLookup MUST still
+    /// MISS — the arg-tolerant fallback is reads-only, so a changed write never
+    /// becomes arg-tolerant and stays strict (so a divergent write is caught).
+    #[test]
+    fn all_lookup_misses_on_rekeyed_write() {
+        let recorded_args = serde_json::json!({ "key": "k_recorded", "value": "0.10" });
+        let table = LookupTable {
+            recording_id: "rec-1".to_owned(),
+            policy_version: 1,
+            entries: vec![entry_with(
+                None,
+                explicit("set_key"),
+                &recorded_args,
+                0,
+                serde_json::json!({ "Ok": null }),
+                1,
+            )],
+        };
+        let observed = InMemoryObservedSink::new();
+        let handle = observed.handle();
+        let hook = LookupTableHook::from_source(VecSource(Some(table)), observed).expect("hook");
+
+        // Same call-site, re-keyed WRITE args — method name is a write verb.
+        let rekeyed_args = serde_json::json!({ "key": "k_recorded", "value": "0.20" });
+        let identity = explicit_identity("set_key");
+        let value = hook.try_replay_with_context(ReplayLookup {
+            boundary: "redis",
+            trait_name: "RedisInterface",
+            method_name: "serialize_and_set_key",
+            args: &rekeyed_args,
+            callsite_identity: Some(&identity),
+            caller_location: None,
+        });
+        assert_eq!(value, None, "a re-keyed WRITE must still MISS (reads-only fallback)");
+        assert!(!handle.lock().unwrap()[0].resolved);
+    }
+
+    /// The SAME re-keyed READ under `SelectiveExecute` resolves via the
+    /// arg-tolerant fallback to the RECORDED result (args ignored, matched by
+    /// call-site identity + occurrence). This is the partial-derivative
+    /// substitution that serves a recorded value even when the args drifted.
+    #[test]
+    fn selective_execute_serves_rekeyed_read_arg_tolerantly() {
+        let recorded_args = serde_json::json!({ "id": "pi_recorded" });
+        let table = LookupTable {
+            recording_id: "rec-1".to_owned(),
+            policy_version: 1,
+            entries: vec![entry_with(
+                None,
+                explicit("find_pi"),
+                &recorded_args,
+                0,
+                serde_json::json!({ "Ok": "row_recorded" }),
+                1,
+            )],
+        };
+        let observed = InMemoryObservedSink::new();
+        let handle = observed.handle();
+        let hook = LookupTableHook::from_source_with_policy(
+            VecSource(Some(table)),
+            observed,
+            crate::Policy::SelectiveExecute,
+            std::collections::HashSet::new(),
+        )
+        .expect("hook");
+
+        let rekeyed_args = serde_json::json!({ "id": "pi_doubled" });
+        let identity = explicit_identity("find_pi");
+        let value = hook.try_replay_with_context(ReplayLookup {
+            boundary: "storage",
+            trait_name: "PaymentIntentInterface",
+            method_name: "find_payment_intent_by_id",
+            args: &rekeyed_args,
+            callsite_identity: Some(&identity),
+            caller_location: None,
+        });
+        assert_eq!(
+            value,
+            Some(serde_json::json!({ "Ok": "row_recorded" })),
+            "SelectiveExecute must serve the recorded result arg-tolerantly"
+        );
+        assert!(handle.lock().unwrap()[0].resolved);
+    }
+
+    /// `execute_mode` is byte-identical (Lookup) under AllLookup for every
+    /// channel, and only flips to Execute for the State channel (db/redis) under
+    /// SelectiveExecute. Entropy/Egress stay Lookup even under SelectiveExecute.
+    #[test]
+    fn execute_mode_respects_policy_and_channel() {
+        let empty = LookupTable {
+            recording_id: "r".to_owned(),
+            policy_version: 1,
+            entries: vec![],
+        };
+
+        let all_lookup = LookupTableHook::from_source(
+            VecSource(Some(empty.clone())),
+            InMemoryObservedSink::new(),
+        )
+        .expect("hook");
+        for boundary in ["storage", "redis", "http_client", "time"] {
+            assert_eq!(
+                all_lookup.execute_mode(boundary, "T", "m"),
+                crate::ExecuteMode::Lookup,
+                "AllLookup must be Lookup for {boundary}"
+            );
+        }
+
+        let selective = LookupTableHook::from_source_with_policy(
+            VecSource(Some(empty)),
+            InMemoryObservedSink::new(),
+            crate::Policy::SelectiveExecute,
+            std::collections::HashSet::new(),
+        )
+        .expect("hook");
+        assert_eq!(
+            selective.execute_mode("storage", "T", "m"),
+            crate::ExecuteMode::Execute
+        );
+        assert_eq!(
+            selective.execute_mode("redis", "T", "m"),
+            crate::ExecuteMode::Execute
+        );
+        assert_eq!(
+            selective.execute_mode("http_client", "T", "m"),
+            crate::ExecuteMode::Lookup,
+            "Egress stays Lookup even under SelectiveExecute"
+        );
+        assert_eq!(
+            selective.execute_mode("time", "T", "m"),
+            crate::ExecuteMode::Lookup,
+            "Entropy stays Lookup even under SelectiveExecute"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Declarative boundary model — decision matrix + the additive fallback.
+    // -----------------------------------------------------------------------
+
+    /// `decide_strategy` covers every declared matrix cell from the design §2
+    /// table under both policies.
+    #[test]
+    fn decide_strategy_covers_every_matrix_cell() {
+        use crate::{Channel, Effect, EntropySource, Policy, Strategy};
+
+        // State + Read/Write: Lookup under AllLookup, SeedAndExecute under
+        // SelectiveExecute.
+        for eff in [Effect::Read, Effect::Write] {
+            assert_eq!(
+                decide_strategy(Some(Channel::State), Some(eff), None, Policy::AllLookup),
+                Strategy::Lookup,
+                "State+{eff:?} AllLookup"
+            );
+            assert_eq!(
+                decide_strategy(
+                    Some(Channel::State),
+                    Some(eff),
+                    None,
+                    Policy::SelectiveExecute
+                ),
+                Strategy::SeedAndExecute,
+                "State+{eff:?} SelectiveExecute"
+            );
+        }
+
+        // State + VolatileRead: Lookup under both policies, even with an execute
+        // override — a time-decaying / non-deterministic-iteration value is never
+        // executed (it would diverge every run).
+        for p in [Policy::AllLookup, Policy::SelectiveExecute] {
+            assert_eq!(
+                decide_strategy(Some(Channel::State), Some(Effect::VolatileRead), None, p),
+                Strategy::Lookup,
+                "State+VolatileRead {p:?}"
+            );
+        }
+        assert_eq!(
+            decide_strategy(
+                Some(Channel::State),
+                Some(Effect::VolatileRead),
+                Some(Strategy::SeedAndExecute),
+                Policy::SelectiveExecute
+            ),
+            Strategy::Lookup,
+            "State+VolatileRead is never executed even with an override"
+        );
+
+        // State + Opaque: Lookup (opt-in via explicit override only).
+        assert_eq!(
+            decide_strategy(
+                Some(Channel::State),
+                Some(Effect::Opaque),
+                None,
+                Policy::SelectiveExecute
+            ),
+            Strategy::Lookup,
+            "State+Opaque defaults Lookup"
+        );
+        assert_eq!(
+            decide_strategy(
+                Some(Channel::State),
+                Some(Effect::Opaque),
+                Some(Strategy::SeedAndExecute),
+                Policy::SelectiveExecute
+            ),
+            Strategy::SeedAndExecute,
+            "State+Opaque honors explicit execute override"
+        );
+
+        // State + Append: Lookup (AllLookup) / LookupAndSeed (Selective).
+        assert_eq!(
+            decide_strategy(
+                Some(Channel::State),
+                Some(Effect::Append),
+                None,
+                Policy::AllLookup
+            ),
+            Strategy::Lookup,
+            "State+Append AllLookup"
+        );
+        assert_eq!(
+            decide_strategy(
+                Some(Channel::State),
+                Some(Effect::Append),
+                None,
+                Policy::SelectiveExecute
+            ),
+            Strategy::LookupAndSeed,
+            "State+Append SelectiveExecute"
+        );
+
+        // State + RMW: Lookup (AllLookup); under SelectiveExecute the per-op
+        // override decides (the macro guarantees it is present).
+        assert_eq!(
+            decide_strategy(
+                Some(Channel::State),
+                Some(Effect::ReadModifyWrite),
+                None,
+                Policy::AllLookup
+            ),
+            Strategy::Lookup,
+            "State+RMW AllLookup"
+        );
+        assert_eq!(
+            decide_strategy(
+                Some(Channel::State),
+                Some(Effect::ReadModifyWrite),
+                None,
+                Policy::SelectiveExecute
+            ),
+            Strategy::Lookup,
+            "State+RMW with no override falls back conservatively to Lookup"
+        );
+        assert_eq!(
+            decide_strategy(
+                Some(Channel::State),
+                Some(Effect::ReadModifyWrite),
+                Some(Strategy::LookupAndSeed),
+                Policy::SelectiveExecute
+            ),
+            Strategy::LookupAndSeed,
+            "State+RMW honors LookupAndSeed override"
+        );
+        assert_eq!(
+            decide_strategy(
+                Some(Channel::State),
+                Some(Effect::ReadModifyWrite),
+                Some(Strategy::SeedAndExecute),
+                Policy::SelectiveExecute
+            ),
+            Strategy::SeedAndExecute,
+            "State+RMW honors SeedAndExecute override"
+        );
+
+        // State with no declared effect → conservative Lookup under both policies.
+        for p in [Policy::AllLookup, Policy::SelectiveExecute] {
+            assert_eq!(
+                decide_strategy(Some(Channel::State), None, None, p),
+                Strategy::Lookup,
+                "State+<no effect> {p:?}"
+            );
+        }
+
+        // Entropy(_) / Egress: Lookup under every policy (no effect declared).
+        for ch in [
+            Channel::Entropy(EntropySource::Clock),
+            Channel::Entropy(EntropySource::Id),
+            Channel::Egress,
+        ] {
+            for p in [Policy::AllLookup, Policy::SelectiveExecute] {
+                assert_eq!(
+                    decide_strategy(Some(ch.clone()), None, None, p),
+                    Strategy::Lookup,
+                    "{ch:?} {p:?}"
+                );
+            }
+        }
+    }
+
+    /// CRITICAL FALLBACK: an UNDECLARED `(None, None)` boundary returns
+    /// `Lookup` from the pure matrix; and `boundary_execute_mode_for` routes
+    /// it to the hook's existing heuristic so its runtime decision is
+    /// BYTE-IDENTICAL to the hook's own `execute_mode` for representative
+    /// boundaries (redis read, db write, id, http) under both policies.
+    #[test]
+    fn undeclared_boundary_matches_current_execute_mode() {
+        use crate::{Policy, Strategy};
+
+        // Pure-matrix undeclared default is the safe Lookup.
+        assert_eq!(
+            decide_strategy(None, None, None, Policy::AllLookup),
+            Strategy::Lookup
+        );
+        assert_eq!(
+            decide_strategy(None, None, None, Policy::SelectiveExecute),
+            Strategy::Lookup
+        );
+
+        // Representative boundaries (boundary, trait, method).
+        let cases: [(&str, &str, &str); 4] = [
+            ("redis", "Cache", "get"),       // State read
+            ("storage", "PI", "insert_x"),   // State write (db)
+            ("id", "Gcm", "nonce"),          // Entropy
+            ("http_client", "Http", "send"), // Egress
+        ];
+
+        for policy in [Policy::AllLookup, Policy::SelectiveExecute] {
+            let empty = LookupTable {
+                recording_id: "r".to_owned(),
+                policy_version: 1,
+                entries: vec![],
+            };
+            let hook = LookupTableHook::from_source_with_policy(
+                VecSource(Some(empty)),
+                InMemoryObservedSink::new(),
+                policy,
+                std::collections::HashSet::new(),
+            )
+            .expect("hook");
+
+            for (b, t, m) in cases {
+                // UNDECLARED spec — the current vendor shape.
+                let spec = BoundarySpec::new(
+                    Box::leak(b.to_string().into_boxed_str()),
+                    Box::leak(t.to_string().into_boxed_str()),
+                    Box::leak(m.to_string().into_boxed_str()),
+                );
+                let via_declarative = boundary_execute_mode_for(&hook, &spec);
+                let via_heuristic = hook.execute_mode(b, t, m);
+                assert_eq!(
+                    via_declarative, via_heuristic,
+                    "undeclared {b}/{t}/{m} under {policy:?} must match the heuristic"
+                );
+            }
+        }
+    }
+
+    /// A DECLARED boundary on an `AllLookup` hook resolves to `Lookup` (every
+    /// AllLookup cell is `Substitute`), so declaring is inert until the policy
+    /// flips — the demo stays green.
+    #[test]
+    fn declared_boundary_is_inert_under_all_lookup() {
+        let empty = LookupTable {
+            recording_id: "r".to_owned(),
+            policy_version: 1,
+            entries: vec![],
+        };
+        let hook = LookupTableHook::from_source(
+            VecSource(Some(empty)),
+            InMemoryObservedSink::new(),
+        )
+        .expect("hook");
+        let spec = BoundarySpec::with_semantics(
+            "redis",
+            "Cache",
+            "get",
+            crate::BoundarySemantics {
+                channel: Some(crate::Channel::State),
+                effect: Some(crate::Effect::Read),
+                strategy: None,
+            },
+        );
+        assert_eq!(
+            boundary_execute_mode_for(&hook, &spec),
+            crate::ExecuteMode::Lookup,
+            "declared State+Read is Lookup under AllLookup (inert)"
+        );
+    }
+
+    /// `strategy_to_execute_mode`: Lookup→Lookup, SeedAndExecute→Execute,
+    /// and the STUBBED LookupAndSeed→Lookup (safe; see TODO(vendor-migration)).
+    #[test]
+    fn strategy_maps_to_execute_mode() {
+        use crate::{ExecuteMode, Strategy};
+        assert_eq!(strategy_to_execute_mode(Strategy::Lookup), ExecuteMode::Lookup);
+        assert_eq!(
+            strategy_to_execute_mode(Strategy::SeedAndExecute),
+            ExecuteMode::Execute
+        );
+        assert_eq!(
+            strategy_to_execute_mode(Strategy::LookupAndSeed),
+            ExecuteMode::Lookup,
+            "LookupAndSeed is stubbed to a safe Lookup in this slice"
+        );
+    }
+
+    /// `Policy::from_env_value` parses the spellings and defaults safely.
+    #[test]
+    fn policy_parsing_defaults_safely() {
+        assert_eq!(
+            crate::Policy::from_env_value("selective_execute"),
+            crate::Policy::SelectiveExecute
+        );
+        assert_eq!(
+            crate::Policy::from_env_value("execute"),
+            crate::Policy::SelectiveExecute
+        );
+        assert_eq!(
+            crate::Policy::from_env_value("all_lookup"),
+            crate::Policy::AllLookup
+        );
+        assert_eq!(crate::Policy::from_env_value(""), crate::Policy::AllLookup);
+        assert_eq!(
+            crate::Policy::from_env_value("garbage"),
+            crate::Policy::AllLookup,
+            "unknown value must default to AllLookup (never silently execute)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Seed-plan pipeline tests (deliverables 1-4, 6) — all PURE, no docker.
+    // -----------------------------------------------------------------------
+
+    /// Build a State event with explicit read/write sets, boundary, and seq.
+    #[allow(clippy::too_many_arguments)]
+    fn state_event(
+        global_seq: u64,
+        correlation_id: Option<&str>,
+        boundary: &str,
+        method: &str,
+        args: serde_json::Value,
+        result: serde_json::Value,
+        read_set: &[&str],
+        write_set: &[&str],
+        is_error: bool,
+    ) -> SemanticEvent {
+        let mut ev = make_event(global_seq, correlation_id, method, args, result, is_error);
+        ev.global_sequence = global_seq;
+        ev.boundary = boundary.into();
+        ev.read_set = read_set.iter().map(|s| (*s).to_owned()).collect();
+        ev.write_set = write_set.iter().map(|s| (*s).to_owned()).collect();
+        ev
+    }
+
+    /// Deliverable 1: the seed-plan builder reconstructs `(boundary, key,
+    /// value)` from every State READ's read_set + recorded result.
+    #[test]
+    fn seed_plan_built_from_read_set_and_result() {
+        let events = vec![
+            // A redis READ of the default rate → precondition redis:rate=0.10.
+            state_event(
+                0,
+                Some("c1"),
+                "redis",
+                "get",
+                serde_json::json!(["settlement_rate_default"]),
+                serde_json::json!("0.10"),
+                &["settlement_rate_default"],
+                &[],
+                false,
+            ),
+            // A db READ → precondition storage:user:42=Alice.
+            state_event(
+                1,
+                Some("c1"),
+                "storage",
+                "find_user",
+                serde_json::json!(["user:42"]),
+                serde_json::json!({"Ok": "Alice"}),
+                &["user:42"],
+                &[],
+                false,
+            ),
+            // A non-State (entropy) event must not produce a seed.
+            {
+                let mut e = make_event(
+                    2,
+                    Some("c1"),
+                    "generate_id",
+                    serde_json::json!([]),
+                    serde_json::json!("uuid"),
+                    false,
+                );
+                e.boundary = "id".into();
+                e
+            },
+        ];
+
+        let plan = build_seed_plan(&events, Some("c1"));
+        assert_eq!(plan.len(), 2, "two State reads → two preconditions");
+        assert_eq!(
+            plan.resolve("redis", "settlement_rate_default").unwrap().value,
+            serde_json::json!("0.10")
+        );
+        assert_eq!(
+            plan.resolve("storage", "user:42").unwrap().value,
+            serde_json::json!({"Ok": "Alice"})
+        );
+        assert!(
+            !plan.contains("id", "uuid"),
+            "entropy boundary is never seeded"
+        );
+        for entry in plan.iter() {
+            assert_eq!(entry.origin, SeedOrigin::Recording);
+        }
+    }
+
+    /// DECLARATIVE BOUNDARY MODEL — `build_seed_plan`/`join_pre_images` PREFER the
+    /// declared `channel`/`effect` and fall back to the heuristics when undeclared.
+    /// Proves the declaration OVERRIDES the name heuristics in both directions:
+    /// a declared-Egress event with a State-channel boundary NAME is NOT seeded,
+    /// and a declared-State event with a non-State boundary NAME IS seeded; a
+    /// declared-Write with a read-NAMED method recovers its pre-image as a write.
+    #[test]
+    fn seed_plan_and_join_prefer_declared_channel_and_effect() {
+        use crate::{Channel, Effect};
+
+        // (a) DECLARED Egress, but the boundary NAME is "redis" (a State name).
+        // The declaration wins → NOT a State event → never seeded.
+        let mut egress_named_redis = state_event(
+            0,
+            Some("c1"),
+            "redis",
+            "find_thing", // read-named
+            serde_json::json!(["k_egress"]),
+            serde_json::json!("v"),
+            &["k_egress"],
+            &[],
+            false,
+        );
+        egress_named_redis.channel = Some(Channel::Egress);
+        egress_named_redis.effect = None;
+
+        // (b) DECLARED State+Read, but the boundary NAME is "outbound" (NOT a State
+        // name). The declaration wins → IS a State read → seeded.
+        let mut state_named_outbound = state_event(
+            1,
+            Some("c1"),
+            "outbound",
+            "do_thing", // NOT a read verb; the declared effect (Read) wins
+            serde_json::json!(["k_state"]),
+            serde_json::json!("seeded"),
+            &["k_state"],
+            &[],
+            false,
+        );
+        state_named_outbound.channel = Some(Channel::State);
+        state_named_outbound.effect = Some(Effect::Read);
+
+        let plan = build_seed_plan(
+            &[egress_named_redis.clone(), state_named_outbound.clone()],
+            Some("c1"),
+        );
+        assert!(
+            !plan.contains("redis", "k_egress"),
+            "a declared-Egress event is never seeded despite a State-channel name"
+        );
+        assert_eq!(
+            plan.resolve("outbound", "k_state").unwrap().value,
+            serde_json::json!("seeded"),
+            "a declared-State Read is seeded despite a non-State boundary name"
+        );
+
+        // (c) join_pre_images: a declared State+Read of "k" (read-set) followed by a
+        // declared State+Write of "k" (write-set) on a NON-State-named boundary,
+        // with a WRITE method that is read-NAMED. The declaration drives the
+        // read→write join; the heuristic (is_read_op on the read-named write) would
+        // have mis-classified the write as a read and produced NO join.
+        let mut read_ev = state_event(
+            0,
+            Some("c1"),
+            "outbound",
+            "find_thing",
+            serde_json::json!(["k"]),
+            serde_json::json!("before"),
+            &["k"],
+            &[],
+            false,
+        );
+        read_ev.channel = Some(Channel::State);
+        read_ev.effect = Some(Effect::Read);
+        let mut write_ev = state_event(
+            1,
+            Some("c1"),
+            "outbound",
+            "find_then_set", // read-NAMED, but DECLARED Write
+            serde_json::json!(["k", "after"]),
+            serde_json::json!("after"),
+            &[],
+            &["k"],
+            false,
+        );
+        write_ev.channel = Some(Channel::State);
+        write_ev.effect = Some(Effect::Write);
+
+        let joins = join_pre_images(&[read_ev, write_ev], Some("c1"));
+        assert_eq!(joins.len(), 1, "declared Write joins to the prior read");
+        assert_eq!(joins[0].boundary, "outbound");
+        assert_eq!(joins[0].key, "k");
+        assert_eq!(joins[0].pre_image, serde_json::json!("before"));
+    }
+
+    /// Deliverable 1: a read AFTER the correlation wrote a key reflects the
+    /// mutation, not the precondition — so the FIRST (pre-write) read wins and a
+    /// post-write read never overwrites the seed.
+    #[test]
+    fn seed_plan_first_pre_write_read_wins() {
+        let events = vec![
+            state_event(
+                0,
+                Some("c1"),
+                "redis",
+                "get",
+                serde_json::json!(["k"]),
+                serde_json::json!("before"),
+                &["k"],
+                &[],
+                false,
+            ),
+            state_event(
+                1,
+                Some("c1"),
+                "redis",
+                "set",
+                serde_json::json!(["k", "after"]),
+                serde_json::json!("after"),
+                &[],
+                &["k"],
+                false,
+            ),
+            // Read-after-write: returns the mutated value, must NOT reseed.
+            state_event(
+                2,
+                Some("c1"),
+                "redis",
+                "get",
+                serde_json::json!(["k"]),
+                serde_json::json!("after"),
+                &["k"],
+                &[],
+                false,
+            ),
+        ];
+        let plan = build_seed_plan(&events, Some("c1"));
+        assert_eq!(
+            plan.resolve("redis", "k").unwrap().value,
+            serde_json::json!("before"),
+            "the precondition is the pre-write value, not the post-write read"
+        );
+    }
+
+    /// Deliverable 1: an errored read carries no value and must not seed.
+    #[test]
+    fn seed_plan_skips_error_reads() {
+        let events = vec![state_event(
+            0,
+            Some("c1"),
+            "redis",
+            "get",
+            serde_json::json!(["k"]),
+            serde_json::json!({"error": "boom"}),
+            &["k"],
+            &[],
+            true,
+        )];
+        let plan = build_seed_plan(&events, Some("c1"));
+        assert!(plan.is_empty(), "an error read seeds nothing");
+    }
+
+    #[test]
+    fn seed_plan_skips_miss_reads() {
+        // A MISS must not be seeded: a redis nil GET records as the string
+        // "Null"; a db miss as JSON null. Seeding either writes a phantom key the
+        // record run never held, so the re-executed read finds it and diverges
+        // (the 18 spurious redis get_key/delete_key value-divergences).
+        let events = vec![
+            state_event(
+                0, Some("c1"), "redis", "get_key",
+                serde_json::json!(["missing"]), serde_json::json!("Null"),
+                &["missing"], &[], false,
+            ),
+            state_event(
+                1, Some("c1"), "db", "find_x",
+                serde_json::json!(["absent"]), serde_json::Value::Null,
+                &["absent"], &[], false,
+            ),
+            // a real HIT alongside, to prove only the misses are skipped
+            state_event(
+                2, Some("c1"), "redis", "get_key",
+                serde_json::json!(["present"]), serde_json::json!({"String": "v"}),
+                &["present"], &[], false,
+            ),
+        ];
+        let plan = build_seed_plan(&events, Some("c1"));
+        assert!(
+            !plan.classify_read("redis", "missing").is_reconstructable(),
+            "a miss read must NOT be seeded"
+        );
+        assert!(
+            !plan.classify_read("db", "absent").is_reconstructable(),
+            "a db null miss must NOT be seeded"
+        );
+        assert!(
+            plan.classify_read("redis", "present").is_reconstructable(),
+            "a real hit IS seeded"
+        );
+    }
+
+    /// Deliverable 1: correlation isolation — only the requested case's reads
+    /// build the plan.
+    #[test]
+    fn seed_plan_is_correlation_scoped() {
+        let events = vec![
+            state_event(
+                0,
+                Some("c1"),
+                "redis",
+                "get",
+                serde_json::json!(["k"]),
+                serde_json::json!("c1val"),
+                &["k"],
+                &[],
+                false,
+            ),
+            state_event(
+                1,
+                Some("c2"),
+                "redis",
+                "get",
+                serde_json::json!(["k"]),
+                serde_json::json!("c2val"),
+                &["k"],
+                &[],
+                false,
+            ),
+        ];
+        let plan = build_seed_plan(&events, Some("c1"));
+        assert_eq!(plan.len(), 1);
+        assert_eq!(
+            plan.resolve("redis", "k").unwrap().value,
+            serde_json::json!("c1val")
+        );
+    }
+
+    /// Deliverable 2: pre_image recovered by JOIN to the most-recent prior read.
+    #[test]
+    fn pre_image_join_recovers_prior_read() {
+        let events = vec![
+            state_event(
+                0,
+                Some("c1"),
+                "redis",
+                "get",
+                serde_json::json!(["k"]),
+                serde_json::json!("v0"),
+                &["k"],
+                &[],
+                false,
+            ),
+            state_event(
+                1,
+                Some("c1"),
+                "redis",
+                "set",
+                serde_json::json!(["k", "v1"]),
+                serde_json::json!("v1"),
+                &[],
+                &["k"],
+                false,
+            ),
+        ];
+        let joins = join_pre_images(&events, Some("c1"));
+        assert_eq!(joins.len(), 1);
+        assert_eq!(joins[0].key, "k");
+        assert_eq!(joins[0].write_global_sequence, 1);
+        assert_eq!(joins[0].pre_image, serde_json::json!("v0"));
+    }
+
+    /// Deliverable 2: a write with no prior read of the key yields no join (its
+    /// pre-image is genuinely unknown from the tape → needs a live probe).
+    #[test]
+    fn pre_image_join_omits_write_without_prior_read() {
+        let events = vec![state_event(
+            0,
+            Some("c1"),
+            "redis",
+            "set",
+            serde_json::json!(["k", "v1"]),
+            serde_json::json!("v1"),
+            &[],
+            &["k"],
+            false,
+        )];
+        let joins = join_pre_images(&events, Some("c1"));
+        assert!(joins.is_empty(), "no prior read → no recoverable pre-image");
+    }
+
+    /// Deliverable 2: a second write joins to the FIRST write's post-image
+    /// (read→write→write chains its pre-images).
+    #[test]
+    fn pre_image_join_chains_through_writes() {
+        let events = vec![
+            state_event(
+                0,
+                Some("c1"),
+                "redis",
+                "get",
+                serde_json::json!(["k"]),
+                serde_json::json!("v0"),
+                &["k"],
+                &[],
+                false,
+            ),
+            state_event(
+                1,
+                Some("c1"),
+                "redis",
+                "set",
+                serde_json::json!(["k", "v1"]),
+                serde_json::json!("v1"),
+                &[],
+                &["k"],
+                false,
+            ),
+            state_event(
+                2,
+                Some("c1"),
+                "redis",
+                "set",
+                serde_json::json!(["k", "v2"]),
+                serde_json::json!("v2"),
+                &[],
+                &["k"],
+                false,
+            ),
+        ];
+        let joins = join_pre_images(&events, Some("c1"));
+        assert_eq!(joins.len(), 2);
+        assert_eq!(joins[0].pre_image, serde_json::json!("v0"));
+        assert_eq!(
+            joins[1].pre_image,
+            serde_json::json!("v1"),
+            "second write's pre-image is the first write's post-image"
+        );
+    }
+
+    /// Deliverable 3: a key in the plan classifies as Reconstructable; a key
+    /// neither in the plan nor the template is a seed-gap (never served stale).
+    #[test]
+    fn classify_read_flags_seed_gap() {
+        let events = vec![state_event(
+            0,
+            Some("c1"),
+            "redis",
+            "get",
+            serde_json::json!(["known"]),
+            serde_json::json!("v"),
+            &["known"],
+            &[],
+            false,
+        )];
+        let plan = build_seed_plan(&events, Some("c1"));
+
+        let hit = plan.classify_read("redis", "known");
+        assert!(hit.is_reconstructable());
+        match hit {
+            ReadClassification::Reconstructable { value, origin } => {
+                assert_eq!(value, serde_json::json!("v"));
+                assert_eq!(origin, SeedOrigin::Recording);
+            }
+            _ => panic!("expected reconstructable"),
+        }
+
+        let gap = plan.classify_read("redis", "never_seen");
+        assert!(!gap.is_reconstructable());
+        assert!(matches!(
+            gap,
+            ReadClassification::NotReconstructable { .. }
+        ));
+    }
+
+    /// Deliverable 4: an ambient template resolves a diverged read to a config
+    /// key the recording never observed — turning a would-be seed-gap into a
+    /// reconstructable read.
+    #[test]
+    fn ambient_template_resolves_config_key() {
+        // Recording only observed the DEFAULT rate.
+        let events = vec![state_event(
+            0,
+            Some("c1"),
+            "redis",
+            "get",
+            serde_json::json!(["settlement_rate_default"]),
+            serde_json::json!("0.10"),
+            &["settlement_rate_default"],
+            &[],
+            false,
+        )];
+        let plan = build_seed_plan(&events, Some("c1"));
+
+        // Without the template the premium key is a seed-gap.
+        assert!(!plan
+            .classify_read("redis", "settlement_rate_premium")
+            .is_reconstructable());
+
+        // Merge the demo ambient defaults.
+        let plan = plan.with_ambient(&AmbientTemplate::demo_defaults());
+        let resolved = plan.classify_read("redis", "settlement_rate_premium");
+        match resolved {
+            ReadClassification::Reconstructable { value, origin } => {
+                assert_eq!(value, serde_json::json!("0.20"));
+                assert_eq!(origin, SeedOrigin::Ambient);
+            }
+            _ => panic!("ambient template should resolve the premium key"),
+        }
+    }
+
+    /// Deliverable 4: a recording-derived precondition wins over an ambient
+    /// default for the SAME key (ambient never clobbers what was observed).
+    #[test]
+    fn ambient_does_not_clobber_recording() {
+        let events = vec![state_event(
+            0,
+            Some("c1"),
+            "redis",
+            "get",
+            serde_json::json!(["settlement_rate_premium"]),
+            serde_json::json!("0.15"),
+            &["settlement_rate_premium"],
+            &[],
+            false,
+        )];
+        let plan = build_seed_plan(&events, Some("c1"))
+            .with_ambient(&AmbientTemplate::demo_defaults());
+        assert_eq!(
+            plan.resolve("redis", "settlement_rate_premium").unwrap().value,
+            serde_json::json!("0.15"),
+            "the observed value (0.15) wins over the ambient default (0.20)"
+        );
+        assert_eq!(
+            plan.resolve("redis", "settlement_rate_premium").unwrap().origin,
+            SeedOrigin::Recording
+        );
+    }
+
+    /// Deliverable 4: the ambient template parses from a TSV file body, JSON-
+    /// typing values (so the demo's config can live in a file).
+    #[test]
+    fn ambient_template_from_tsv() {
+        let body = "\
+# demo ambient config
+redis\tsettlement_rate_premium\t0.20
+redis\tcurrency\tusd
+";
+        let template = AmbientTemplate::from_tsv(body);
+        assert_eq!(template.entries().len(), 2);
+        let plan = SeedPlan::new().with_ambient(&template);
+        assert_eq!(
+            plan.resolve("redis", "settlement_rate_premium").unwrap().value,
+            serde_json::json!(0.20),
+            "0.20 parses as a JSON number"
+        );
+        assert_eq!(
+            plan.resolve("redis", "currency").unwrap().value,
+            serde_json::json!("usd"),
+            "bare token becomes a JSON string"
+        );
+    }
+
+    /// Deliverable 6: a fake StateProbe captures the pre-image (before) and the
+    /// result_image (after) of a single-op RMW.
+    #[test]
+    fn state_probe_captures_pre_and_post_images() {
+        let probe = InMemoryStateProbe::new([(
+            "redis".to_owned(),
+            "counter".to_owned(),
+            serde_json::json!(1),
+        )]);
+
+        // peek: capture pre-image before the real op.
+        let images = probe_rmw_images(&probe, "redis", "counter");
+        assert_eq!(images.pre_image, Some(serde_json::json!(1)));
+        assert_eq!(images.result_image, None);
+
+        // simulate the real RMW op incrementing the counter.
+        probe.set("redis", "counter", serde_json::json!(2));
+
+        // observe: capture post-image after the real op.
+        let images = complete_rmw_images(images, &probe, "redis", "counter");
+        assert_eq!(images.pre_image, Some(serde_json::json!(1)));
+        assert_eq!(images.result_image, Some(serde_json::json!(2)));
+    }
+
+    /// Deliverable 6: a probe of an absent key yields `None` images (no false
+    /// pre-image for a key the store does not hold).
+    #[test]
+    fn state_probe_absent_key_is_none() {
+        let probe = InMemoryStateProbe::default();
+        let images = probe_rmw_images(&probe, "redis", "missing");
+        assert_eq!(images.pre_image, None);
+        let images = complete_rmw_images(images, &probe, "redis", "missing");
+        assert_eq!(images.result_image, None);
+    }
+
+    /// Deliverable 6 (wiring): the execute-shadow path on the concrete
+    /// `LookupTableHook` captures `pre_image` at peek and `result_image` at
+    /// observe via the installed `StateProbe`, stamping both onto the emitted
+    /// shadow `ObservedCall`. This is the in-memory stand-in for the live docker
+    /// probe; only the probe backend differs in production.
+    #[test]
+    fn hook_execute_shadow_captures_rmw_images_via_probe() {
+        let table = LookupTable {
+            recording_id: "rec-rmw".to_owned(),
+            policy_version: 1,
+            entries: vec![entry_with(
+                None,
+                Address::Sequence {
+                    boundary: "redis".to_owned(),
+                    method: "incr".to_owned(),
+                    request_sequence: 0,
+                },
+                &serde_json::json!(["counter"]),
+                0,
+                serde_json::json!(2), // recorded baseline result
+                7,
+            )],
+        };
+        let observed = InMemoryObservedSink::new();
+        let handle = observed.handle();
+        // Probe starts with counter=1; the "real op" increments it to 2.
+        // Keep a clone to mutate the shared store between peek and observe,
+        // modelling the real boundary's write.
+        let probe = InMemoryStateProbe::new([(
+            "redis".to_owned(),
+            "counter".to_owned(),
+            serde_json::json!(1),
+        )]);
+        let probe_handle = probe.clone();
+        let hook = LookupTableHook::from_source_with_policy(
+            VecSource(Some(table)),
+            observed,
+            crate::Policy::SelectiveExecute,
+            std::collections::HashSet::new(),
+        )
+        .expect("from_source")
+        .with_state_probe(Box::new(probe));
+
+        let args = serde_json::json!(["counter"]);
+        let query = ReplayLookup {
+            boundary: "redis",
+            trait_name: "RedisStore",
+            method_name: "incr",
+            args: &args,
+            callsite_identity: None,
+            caller_location: None,
+        };
+
+        // peek captures pre-image=1.
+        let token = hook.execute_shadow_peek(query).expect("peek token");
+        // The macro would now run the real op; model its write (counter 1 → 2).
+        probe_handle.set("redis", "counter", serde_json::json!(2));
+        // observe captures post-image=2 and stamps the real result.
+        DejaHook::execute_shadow_observe(&hook, token, serde_json::json!(2));
+
+        let calls = handle.lock().unwrap();
+        assert_eq!(calls.len(), 1, "one shadow observation emitted");
+        let call = &calls[0];
+        assert_eq!(call.provenance, crate::Provenance::ExecuteShadow);
+        assert_eq!(
+            call.pre_image,
+            Some(serde_json::json!(1)),
+            "pre-image probed at peek (counter before op)"
+        );
+        assert_eq!(
+            call.result_image,
+            Some(serde_json::json!(2)),
+            "post-image probed at observe (counter after the real op)"
+        );
+        assert_eq!(call.observed_result, Some(serde_json::json!(2)));
     }
 }

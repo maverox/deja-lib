@@ -98,9 +98,16 @@ start_api() {
   DEMO_KERNEL_BIN="$(pwd)/target/release/replay-harness-kernel" \
   DEMO_KAFKA_TOPIC="hyperswitch-deja-recording-events" \
   DEJA_CODE_REF="$(git -C "$VENDOR" rev-parse HEAD 2>/dev/null || echo unknown)" \
+  DEJA_POLICY="${DEJA_POLICY:-AllLookup}" \
   STRIPE_API_KEY="$STRIPE_API_KEY" \
     ./target/release/replay-harness-api &
   API_PID=$!
+  # NOTE: the orchestrator is long-lived, so its process DEJA_POLICY is fixed
+  # here (default AllLookup = no_regression). The per-replay policy travels with
+  # each run via post_run (spec.deja_policy + X-Deja-Policy header); the final
+  # env-to-replay-container hop (compose_env forward + the overlay's replay
+  # service `DEJA_POLICY:` passthrough) is the Rust/overlay integration step.
+  # The scorecard `mode_provenance` stamp self-identifies the mode regardless.
 
   local _i
   for _i in $(seq 1 30); do
@@ -114,15 +121,57 @@ start_api() {
 
 # POST a run spec. Sends the audit actor (decision 8); the optional second
 # argument is a human expectation note ("pass" / "diverge") recorded on the
-# run row for the dashboard.
+# run row for the dashboard. The optional third argument is the replay POLICY
+# (AllLookup | SelectiveExecute) for the M1 A/B contrast: it is embedded on the
+# spec as `deja_policy` so a policy-aware orchestrator picks it up PER-RUN (the
+# long-lived API can't be re-env'd per replay). The current strict RunSpec parse
+# drops the extra field harmlessly (no_regression: default AllLookup = today's
+# full-mock behavior); the divergence engine wiring consumes it once landed.
 DEJA_ACTOR="script:${USER:-unknown}"
 post_run() {
-  local spec="$1" expectation="${2:-}"
+  local spec="$1" expectation="${2:-}" policy="${3:-}"
   if [ -n "$expectation" ]; then
     spec=$(echo "$spec" | jq -c --arg e "$expectation" '. + {expectation: $e}')
   fi
+  if [ -n "$policy" ]; then
+    spec=$(echo "$spec" | jq -c --arg p "$policy" '. + {deja_policy: $p}')
+  fi
   curl -fsS -H 'content-type: application/json' -H "X-Deja-Actor: ${DEJA_ACTOR}" \
+    -H "X-Deja-Policy: ${policy:-AllLookup}" \
     -d "$spec" "${API}/api/v1/runs" | jq -r .run_id
+}
+
+# Map a replay POLICY to its derived MODE (the per-boundary dispatch decision):
+#   AllLookup        → Lookup   (full-mock = PARTIAL derivative; today's behavior)
+#   SelectiveExecute → Execute  (run the real {db} query = TOTAL derivative)
+# Used for the summary MODE column and the scorecard's mode-provenance stamp.
+policy_to_mode() { # policy_to_mode <policy>
+  case "$1" in
+    SelectiveExecute*) echo "Execute" ;;
+    *)                 echo "Lookup"  ;;
+  esac
+}
+
+# Stamp MINIMAL mode-provenance into the run's scorecard JSON artifact, so the
+# REPORT itself self-identifies which policy/mode produced its verdict — not just
+# the shell's in-memory bookkeeping. Two A/B rows from one case otherwise share a
+# schema and are indistinguishable on disk; this merges a `mode_provenance` block
+# (additive, never overwrites existing scorecard fields) keyed by the policy this
+# script drove the run under. Best-effort: a missing card or jq hiccup is a warn,
+# never a hard fail (the verdict still stands).
+stamp_scorecard_mode() { # stamp_scorecard_mode <run_id> <policy> <mode>
+  local rid="$1" policy="$2" mode="$3"
+  local card="$STATE_DIR/runs/${rid}.scorecard.json"
+  [ -f "$card" ] || { echo "   (mode-provenance: no scorecard at $card; skipped)"; return 0; }
+  local tmp="${card}.tmp.$$"
+  if jq --arg p "$policy" --arg m "$mode" \
+        '.mode_provenance = {policy: $p, mode: $m, stamped_by: "run-deja-matrix.sh"}' \
+        "$card" >"$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$card"
+  else
+    rm -f "$tmp"
+    echo "   WARNING: mode-provenance stamp failed for $rid (scorecard left unmodified)"
+  fi
 }
 
 # Print the dashboard deep link for a run (the web UI serves at the API root).

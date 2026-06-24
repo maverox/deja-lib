@@ -7,7 +7,10 @@ export type RunRow = {
   recording_id: string | null;
   candidate: Record<string, unknown>;
   candidate_sha256: string | null;
-  params: Record<string, unknown>;
+  // Serialized RunSpec params. NOTE: the API currently only persists
+  // { workload } here — deja_policy is NOT included (see report / API gap),
+  // so `params.deja_policy` is read defensively in case it lands later.
+  params: { workload?: unknown; deja_policy?: string | null; [k: string]: unknown };
   state: string;
   verdict: "pass" | "fail" | "inconclusive" | null;
   scorecard: Scorecard | null;
@@ -94,13 +97,24 @@ export type Scorecard = {
     side_effect_divergences: number;
     omitted_calls?: number;
     novel_calls?: number;
+    // M1 (SelectiveExecute / total-derivative): a non-zero value_divergences is
+    // the headline CATCH — the candidate ran the real boundary and produced a
+    // value differing from the recorded baseline. Always 0 under AllLookup.
+    value_divergences?: number;
+    inconclusive_seed_gaps?: number;
     environmental_misses?: number;
     recovered_rank5_calls?: number;
     resolved_by_rank: Record<string, number>;
   };
   per_boundary?: Record<
     string,
-    { matched?: number; diverged?: number; tier?: string; [k: string]: unknown }
+    {
+      matched?: number;
+      diverged?: number;
+      tier?: string;
+      kinds?: Record<string, number>;
+      [k: string]: unknown;
+    }
   >;
   per_correlation?: {
     correlation_id: string;
@@ -130,9 +144,14 @@ export type CallRecord = {
   boundary: string;
   trait_name: string;
   method_name: string;
-  // matched | recovered | novel | omitted | environmental | deterministic
+  // matched | recovered | novel | omitted | environmental | deterministic |
+  // value_diverged
   kind: string;
   blocking: boolean;
+  // For a value_diverged row: true on the ORIGIN (executed read whose real value
+  // differed — the cause), false on the CONSEQUENCE (downstream write). Absent
+  // on every other kind.
+  origin?: boolean;
   resolved_rank?: number;
   recorded?: CallSide;
   observed?: CallSide;

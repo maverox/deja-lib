@@ -64,6 +64,12 @@ pub struct RunSpec {
     /// For mode=record: workload arguments (kept opaque for now).
     #[serde(default)]
     pub workload: serde_json::Value,
+    /// For mode=replay: the boundary execution policy the replay container runs
+    /// under — "AllLookup" (full-mock / partial derivative, the no-regression
+    /// default) or "SelectiveExecute" (seed-and-run / total derivative).
+    /// Forwarded to the replay container as DEJA_POLICY.
+    #[serde(default)]
+    pub deja_policy: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

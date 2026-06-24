@@ -25,6 +25,15 @@ pub use deja_record::replay::{
     KeyStamper, LocalFileLookupSource, LookupEntry, LookupKey, LookupTable, LookupTableHook,
     LookupTableSource, ObservedCall, ObservedCallSink,
 };
+/// Re-export the total-derivative seeding pipeline (pure seed-plan builder,
+/// pre-image join, diverged-read classification, ambient template) and the
+/// execute-shadow RMW state-probe abstraction so the harness materializes seeds
+/// from a recording instead of hand-coded literals.
+pub use deja_record::replay::{
+    build_seed_plan, complete_rmw_images, join_pre_images, probe_rmw_images, AmbientTemplate,
+    InMemoryStateProbe, PreImageJoin, ReadClassification, RmwImages, SeedEntry, SeedOrigin,
+    SeedPlan, StateProbe,
+};
 /// Re-export the correlation-propagation tracing layer, which mirrors the ingress
 /// `request_id` span field into deja-context so spawned-task boundary events
 /// inherit the request correlation.
@@ -37,21 +46,40 @@ pub use deja_record::ExecutionGraphLayer;
 /// one `deja` dependency.
 pub use deja_record::{
     flush_global_hook, global_hook_from_env, hook_from_env, AsyncRecordWriter, CompositeSink,
-    EventBuilder, JsonlSink, LazyEventFinalizer, MarkerKind, NoOpHook, RecordSink, RecordingHook,
-    SemanticEvent, SinkPolicy, WriterConfig, WriterStatsSnapshot, DEJA_BATCH_SIZE_ENV_VAR,
-    DEJA_FLUSH_INTERVAL_MS_ENV_VAR, DEJA_GRAPH_DIR_ENV_VAR, DEJA_QUEUE_CAPACITY_ENV_VAR,
-    DEJA_SINK_POLICY_ENV_VAR,
+    EventBuilder, JsonlSink, LazyEventFinalizer, MarkerKind, NoOpHook, Provenance, Recon,
+    RecordSink, RecordingHook, SemanticEvent, SinkPolicy, WriterConfig, WriterStatsSnapshot,
+    DEJA_BATCH_SIZE_ENV_VAR, DEJA_FLUSH_INTERVAL_MS_ENV_VAR, DEJA_GRAPH_DIR_ENV_VAR,
+    DEJA_QUEUE_CAPACITY_ENV_VAR, DEJA_SINK_POLICY_ENV_VAR,
 };
 /// Re-export callsite identity and runtime hook primitives for the
 /// `DEJA_MODE=record|replay` foundation.
 pub use deja_record::{
-    flush_global_runtime_hook, global_runtime_hook_from_env, runtime_hook_from_env,
-    set_global_runtime_hook, stable_callsite_hash, CallsiteIdentity, CallsiteSource, ReplayLookup,
-    RuntimeHook,
+    flush_global_runtime_hook, global_runtime_hook_from_env, replay_is_active,
+    runtime_hook_from_env, set_global_runtime_hook, stable_callsite_hash, CallsiteIdentity,
+    CallsiteSource, ExecuteMode, ExecuteShadowToken, Policy, ReplayLookup, RuntimeHook,
+};
+/// Re-export the DECLARATIVE BOUNDARY MODEL primitives: the declared semantic
+/// enums, the descriptor-carried [`BoundarySemantics`], and the pure decision
+/// matrix [`decide_strategy`] (+ its `ExecuteMode` mapping and the hook-aware
+/// runtime entry point). The vendor migration declares with these.
+pub use deja_record::{
+    BoundarySemantics, Channel, Effect, EntropySource, Strategy,
+};
+pub use deja_record::replay::{
+    boundary_execute_mode_for, decide_strategy, strategy_to_execute_mode,
 };
 /// Re-export replay primitives so `deja::*` consumers get the full replay API.
 pub use deja_record::{
     ArgMismatchPolicy, Divergence, DivergenceKind, ReplayConfig, ReplayHook, ReplayReport,
+};
+/// Re-export the per-request recording sampling gate. The host (e.g. Hyperswitch)
+/// resolves *whether* to record from Superposition at ingress and pushes the
+/// boolean here; Déjà only consumes it — `false` makes the recording hook a
+/// no-op for the request, `true` records as usual. Absent any decision the gate
+/// defaults to recording, so a host without a sampler is unaffected.
+pub use deja_context::{
+    clear_recording_decision, recording_decision, recording_decision_for_current,
+    set_recording_decision,
 };
 
 /// The deja library version, for sinks that stamp provenance on the wire
@@ -262,12 +290,16 @@ pub mod http {
     {
         let mut output = serde_json::Map::new();
         for (name, value) in headers {
-            output
+            // SHADOW GUARANTEE: this only ever inserts arrays, so the downcast
+            // cannot realistically fail — but never panic on a recording path.
+            // Skip a malformed entry rather than unwinding into the request.
+            if let Some(array) = output
                 .entry(name.into())
                 .or_insert_with(|| serde_json::Value::Array(Vec::new()))
                 .as_array_mut()
-                .expect("header map values are inserted as arrays")
-                .push(serde_json::Value::String(value.into()));
+            {
+                array.push(serde_json::Value::String(value.into()));
+            }
         }
         serde_json::Value::Object(output)
     }
@@ -362,6 +394,54 @@ pub mod db {
         Unit,
     }
 
+    /// The DECLARED semantics for the generic db seam (declarative boundary model).
+    ///
+    /// Every generic db op lives on [`Channel::State`](crate::__private::Channel::State)
+    /// — the only execute-eligible channel. The [`Effect`](crate::__private::Effect)
+    /// (read vs write) is the State-channel sub-classification: the generic db
+    /// helpers are plain reads/writes (NO read-modify-write in this seam), so
+    /// `strategy` stays `None`.
+    ///
+    /// BEHAVIOR-PRESERVING: this declaration replaces, for the db seam, the
+    /// name-heuristic pair (`is_state_channel("db")` → `true`,
+    /// `is_read_op(operation)` → read/write) that `EventBuilder::finish` and the
+    /// pure analyzers used to compute. The declared [`Effect`] is therefore keyed
+    /// off the SAME `is_read_op` verdict the heuristic produced, so the resulting
+    /// `read_set`/`write_set` and the `decide_strategy` matrix cell are byte-identical
+    /// to the pre-declaration path:
+    ///
+    /// - Reads (`generic_find_by_id_core`, `generic_find_one_core`, `generic_filter`,
+    ///   `generic_count`, ...) → [`Effect::Read`](crate::__private::Effect::Read)
+    ///   whenever `is_read_op` classifies the op as a read.
+    /// - Writes (`generic_insert`, `generic_update*`, `generic_delete*`, ...) and
+    ///   any op `is_read_op` does not recognize as a read →
+    ///   [`Effect::Write`](crate::__private::Effect::Write).
+    ///
+    /// (Several `generic_*` names — e.g. `generic_find_by_id_core`, `generic_count`,
+    /// `generic_filter` — are *intrinsically* reads but are NOT matched by the
+    /// current `is_read_op` verb list, so they classify as `Write` today. Honoring
+    /// the heuristic verdict here keeps this slice byte-identical; re-classifying
+    /// those ops as `Read` is a follow-up that lands together with the heuristic
+    /// deletion, NOT in this behavior-preserving migration.)
+    fn db_semantics(operation: &str) -> crate::__private::BoundarySemantics {
+        use crate::__private::{Channel, Effect};
+        // Match the heuristic's read/write verdict EXACTLY (see doc comment): the
+        // declared effect must reproduce the `is_read_op` classification the
+        // pre-declaration `finish` / analyzers used, or `read_set`/`write_set`
+        // would shift for the db seam.
+        let effect = if crate::__private::is_read_op(operation) {
+            Effect::Read
+        } else {
+            Effect::Write
+        };
+        crate::__private::BoundarySemantics {
+            channel: Some(Channel::State),
+            effect: Some(effect),
+            // No read-modify-write in the generic db seam → no per-op strategy.
+            strategy: None,
+        }
+    }
+
     /// Record AND replay a database query, Ok-only.
     ///
     /// On replay (a lookup-table hook installed), the recorded `Ok` row(s) are
@@ -383,6 +463,12 @@ pub mod db {
     /// recorded `kind` at REPLAY time (returning `None` to fall through to live
     /// execution). Both closures live with the boundary's macro, which knows the
     /// concrete error type — the deja fn stays error-type agnostic.
+    // The hand-written DB seam still calls `replay_boundary` directly: it carries
+    // bespoke `recover_err` control flow (deterministic DB errors like NotFound
+    // are reconstructed and replayed faithfully) that does not fit the generic
+    // `dispatch` reconstruct closure. Migrating it is explicitly descoped to a
+    // follow-up (design §6 Step 6), so suppress the deprecation here.
+    #[allow(deprecated)]
     #[track_caller]
     pub fn record_query_async<F, R, E, K, G>(
         spec: QuerySpec,
@@ -436,11 +522,69 @@ pub mod db {
                 logical_context: crate::__private::current_logical_span_path(),
             };
 
+            // DECLARED semantics for this db op (declarative boundary model). All
+            // generic db ops are `Channel::State`; the effect is the `is_read_op`
+            // verdict (byte-identical to the heuristic — see `db_semantics`). Thread
+            // it into the `BoundarySpec` the execute-mode / deprecated seams read
+            // (so `boundary_execute_mode_for` resolves the DECLARED matrix cell —
+            // which equals the heuristic's `execute_mode("db", ...)` for State) AND
+            // into the `EventBuilder` (so `finish` stamps the declaration and derives
+            // `read_set`/`write_set` from it). The State matrix cell equals the
+            // heuristic verdict: Lookup under AllLookup, Execute under SelectiveExecute.
+            let __deja_semantics = db_semantics(spec.operation);
+
+            // EXECUTE-SHADOW (total derivative): under SelectiveExecute the db
+            // boundary (a State channel) EXECUTES the real query against the
+            // reconstructed db and shadow-records the observed result
+            // (provenance = ExecuteShadow), instead of substituting the recorded
+            // value. The ordered kernel replay rebuilds db state as it drives
+            // requests in record order, so executed reads find their data.
+            // Inert under AllLookup (boundary_execute_mode returns Lookup), so
+            // this is the hand-written db analogue of the macro's execute arm.
+            if matches!(
+                crate::__private::boundary_execute_mode(
+                    &crate::__private::BoundarySpec::with_semantics(
+                        spec.boundary,
+                        spec.component,
+                        spec.operation,
+                        __deja_semantics.clone(),
+                    )
+                ),
+                crate::__private::ExecuteMode::Execute
+            ) {
+                let __deja_token = crate::__private::execute_shadow_peek_boundary(
+                    caller,
+                    &crate::__private::BoundarySpec::with_semantics(
+                        spec.boundary,
+                        spec.component,
+                        spec.operation,
+                        __deja_semantics.clone(),
+                    ),
+                    &request,
+                    Some(&__deja_identity),
+                );
+                let output = future.await;
+                if let Some(token) = __deja_token {
+                    // Serialize the observed result with the SAME structured
+                    // envelope the record path uses (`result_serialize_db`), so
+                    // the post-hoc tally pairs recorded ↔ shadow like-for-like.
+                    let (observed, _is_err) =
+                        crate::value::result_serialize_db(&output, &extract_kind);
+                    crate::__private::execute_shadow_observe_boundary(token, observed);
+                }
+                return output;
+            }
+
             // REPLAY: serve the recorded result, skipping the query.
             // `replay_boundary` returns None in record/no-op mode.
             if let Some(recorded) = crate::__private::replay_boundary(
                 caller,
-                crate::__private::BoundarySpec::new(spec.boundary, spec.component, spec.operation),
+                &crate::__private::BoundarySpec::with_semantics(
+                    spec.boundary,
+                    spec.component,
+                    spec.operation,
+                    __deja_semantics.clone(),
+                ),
                 &request,
                 Some(&__deja_identity),
             ) {
@@ -474,6 +618,7 @@ pub mod db {
                 caller,
                 request,
                 Some(__deja_identity),
+                __deja_semantics,
             );
             let output = future.await;
             finish_query_event(event, &output, result_kind, &extract_kind);
@@ -546,6 +691,7 @@ pub mod db {
         caller: &'static std::panic::Location<'static>,
         request: serde_json::Value,
         identity: Option<crate::CallsiteIdentity>,
+        semantics: crate::__private::BoundarySemantics,
     ) -> Option<(std::sync::Arc<dyn crate::DejaHook>, crate::EventBuilder)> {
         use crate::DejaHook;
 
@@ -554,18 +700,26 @@ pub mod db {
             return None;
         }
 
-        let mut event = crate::EventBuilder::start_with_correlation_id(
-            hook.as_ref(),
-            boundary,
-            component,
-            operation,
-            caller,
-            correlation_id,
-            request,
-        );
-        if let Some(identity) = identity {
-            event = event.with_callsite_identity(identity);
-        }
+        // SHADOW GUARANTEE: never let recording setup panic into the real query.
+        let event = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut event = crate::EventBuilder::start_with_correlation_id(
+                hook.as_ref(),
+                boundary,
+                component,
+                operation,
+                caller,
+                correlation_id,
+                request,
+            )
+            // DECLARED semantics so `finish` derives `read_set`/`write_set` and the
+            // stamped channel/effect from the declaration (not the name heuristic).
+            .with_semantics(semantics);
+            if let Some(identity) = identity {
+                event = event.with_callsite_identity(identity);
+            }
+            event
+        }))
+        .ok()?;
         Some((hook, event))
     }
 
@@ -578,16 +732,21 @@ pub mod db {
         R: serde::Serialize,
         E: Debug,
     {
-        let Some((hook, event)) = event else {
-            return;
-        };
+        // SHADOW GUARANTEE: result serialization + the sink enqueue run after the
+        // real query already produced `output`; a panic here must never turn a
+        // successful query into a failed request — it just drops the event.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let Some((hook, event)) = event else {
+                return;
+            };
 
-        // Record the result in the STRUCTURED, versioned DejaDatabaseResult
-        // shape: an Ok records the serialized row(s) (so replay can reconstruct
-        // it); an Err records a stable `{kind, message}` derived by the
-        // boundary's `extract_kind` so replay matches on the discriminant.
-        let (response, is_error) = crate::value::result_serialize_db(output, extract_kind);
-        event.finish(hook.as_ref(), response, is_error);
+            // Record the result in the STRUCTURED, versioned DejaDatabaseResult
+            // shape: an Ok records the serialized row(s) (so replay can reconstruct
+            // it); an Err records a stable `{kind, message}` derived by the
+            // boundary's `extract_kind` so replay matches on the discriminant.
+            let (response, is_error) = crate::value::result_serialize_db(output, extract_kind);
+            event.finish(hook.as_ref(), response, is_error);
+        }));
     }
 }
 
@@ -598,12 +757,32 @@ pub mod __private {
     /// Scope a closure to a correlation id (used by integration middleware to
     /// bind the request id around handler execution).
     pub use deja_context::scope as scope_correlation;
+    // The single boundary-crossing seam the `#[deja::boundary]` family emits.
+    // `dispatch` owns ALL replay/record/execute control flow internally, so the
+    // macro names no replay-only operation. The older `replay_boundary` /
+    // `boundary_execute_mode` / `execute_shadow_*` seams are re-exported only for
+    // backward compatibility (they are `#[deprecated]` in deja-record and are
+    // subsumed by `dispatch`).
+    #[allow(deprecated)]
     pub use deja_record::{
-        current_logical_span_path, finish_boundary_event, next_boundary_occurrence,
-        record_boundary_async, record_boundary_async_lazy, record_boundary_sync,
-        record_boundary_sync_lazy, replay_boundary, stable_callsite_hash,
+        boundary_execute_mode, capture_is_active, current_logical_span_path, dispatch, replay_is_active,
+        dispatch_async,
+        execute_shadow_observe_boundary, execute_shadow_peek_boundary, finish_boundary_event,
+        next_boundary_occurrence, record_boundary_async, record_boundary_async_lazy,
+        record_boundary_sync, record_boundary_sync_lazy, replay_boundary, stable_callsite_hash,
         start_boundary_event_lazy, BoundarySpec, CallsiteIdentity, CallsiteSource,
+        CrossingObservation, ExecuteMode, ExecuteShadowToken,
     };
+    // Declarative boundary model: the declared semantic enums + the descriptor
+    // payload the boundary macro emits into `BoundarySpec::with_semantics`.
+    pub use deja_record::{
+        BoundarySemantics, Channel, Effect, EntropySource, Strategy,
+    };
+    // The read/write name heuristic, re-exported ONLY so the hand-written db seam
+    // can DECLARE an effect that is byte-identical to the verdict the heuristic
+    // produced (see `db::db_semantics`). It remains the undeclared-boundary
+    // fallback inside deja-record; deletion is a later step.
+    pub use deja_record::replay::is_read_op;
 }
 
 #[cfg(test)]

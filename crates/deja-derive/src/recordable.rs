@@ -272,28 +272,25 @@ fn generate_async_method(
     } else {
         quote!()
     };
-    let replay_attempt = if enable_replay {
+    // The reconstruct closure handed to the single `dispatch_async_with_hook`
+    // seam: on a lookup HIT it turns the recorded JSON back into the return type,
+    // returning `None` to FALL THROUGH to live execution (deserialize failure /
+    // the V1 "skip error arms" policy). For the record-only delegate it is
+    // `|_| None` — UNREACHABLE (the recording hook never returns a lookup hit) —
+    // so the `DeserializeOwned` capability is confined to the replay variant's
+    // closure and record-only return types compile WITHOUT any serde bound.
+    let reconstruct_closure = if enable_replay {
         quote! {
-            // Attempt replay first.
-            if let Some(__deja_replay_json) = ::deja_record::DejaHook::try_replay_with_context(
-                &*self.$hook,
-                ::deja_record::ReplayLookup {
-                    boundary: $boundary,
-                    trait_name: #trait_name,
-                    method_name: #method_name_lit,
-                    args: &__deja_args,
-                    callsite_identity: ::core::option::Option::Some(&__deja_identity),
-                    caller_location: ::core::option::Option::Some(__deja_caller),
-                },
-            ) {
-                if let Ok(__deja_replayed) = ::serde_json::from_value::<#return_type>(__deja_replay_json) {
-                    return Box::pin(async move { __deja_replayed });
-                }
-                // Deserialization failed — fall through to real call.
+            |__deja_recorded: ::serde_json::Value| -> ::core::option::Option<#return_type> {
+                ::serde_json::from_value::<#return_type>(__deja_recorded).ok()
             }
         }
     } else {
-        quote!()
+        quote! {
+            |_: ::serde_json::Value| -> ::core::option::Option<#return_type> {
+                ::core::option::Option::None
+            }
+        }
     };
 
     quote! {
@@ -311,7 +308,12 @@ fn generate_async_method(
             Self: #async_lt,
             #replay_bound
         {
-            // Fast path: skip all recording overhead when hook is inactive.
+            // Fast path: skip all recording overhead when the hook is inactive.
+            // This stays in the macro (not a replay-only operation — it is the
+            // recording gate). On the active path args are serialized eagerly,
+            // exactly as before: the async method returns a `Box::pin` future into
+            // which both the args image and the run block are moved, which forbids
+            // a borrowing lazy args thunk (a returned future cannot borrow locals).
             if !::deja_record::DejaHook::is_active(&*self.$hook) {
                 return Box::pin(async move {
                     self.$inner.#method_ident(#(#delegation_args),*).await
@@ -326,20 +328,9 @@ fn generate_async_method(
             });
             let __deja_args = #args_json;
 
-            // Build CallsiteIdentity (used by replay lookup and event recording).
-            // Identity resolves at rank-3 (SyntacticHash) and rank-4 (LexicalPath /
-            // module path) instead of the legacy file:line that never materialized
-            // a usable stable address (rank-2 LogicalContext is the runtime
-            // span-path, stamped below via current_logical_span_path):
-            //   - source: SyntacticHash (so the stable cascade and the occurrence
-            //     bucket both key on a stable source).
-            //   - syntax_hash: FNV-1a over "{trait}::{method}", computed at
-            //     macro-expansion time and emitted as a literal — stable across
-            //     source line shifts.
-            //   - lexical_path: module_path!() (NOT file!()), the stable module
-            //     path that `addresses_for` turns into a rank-4 address.
-            //   - occurrence: allocated EXACTLY ONCE here and reused for both the
-            //     replay lookup (#replay_attempt) and the recorded event.
+            // Build CallsiteIdentity ONCE (occurrence allocated once here and reused
+            // by the seam for both the replay lookup and the recorded event). See the
+            // pre-`dispatch` rationale: rank-3 SyntacticHash + rank-4 LexicalPath.
             let __deja_correlation_id_for_identity = ::deja_context::current_correlation_id();
             let __deja_identity_scope_string = format!("{}::{}", #trait_name, #method_name_lit);
             let __deja_identity_scope = ::core::option::Option::Some(__deja_identity_scope_string.as_str());
@@ -360,23 +351,28 @@ fn generate_async_method(
                 logical_context: ::deja_record::current_logical_span_path(),
             };
 
-            #replay_attempt
-
-            Box::pin(async move {
-                let __deja_builder = ::deja_record::EventBuilder::start_with_receiver(
-                    &*self.$hook,
-                    $boundary,
-                    #trait_name,
-                    #method_name_lit,
-                    __deja_caller,
-                    ::core::option::Option::Some(__deja_receiver),
-                    __deja_args,
-                ).with_callsite_identity(__deja_identity);
-                let __deja_result = self.$inner.#method_ident(#(#delegation_args),*).await;
-                let (__deja_result_json, __deja_is_err) = #result_json_expr;
-                __deja_builder.finish(&*self.$hook, __deja_result_json, __deja_is_err);
-                __deja_result
-            })
+            // ONE seam: collapses the former execute / replay / record arms into a
+            // single call that owns all run/skip/shadow/record control flow. The
+            // delegate macro names NO replay-only operation. The seam yields the
+            // method's return type; the macro re-wraps it in the `Box::pin` the
+            // manually-desugared async-trait signature requires.
+            Box::pin(::deja_record::dispatch_async_with_hook(
+                ::deja_record::DelegateObservation {
+                    hook: &*self.$hook,
+                    boundary: $boundary,
+                    trait_name: #trait_name,
+                    method_name: #method_name_lit,
+                    caller: __deja_caller,
+                    identity: __deja_identity,
+                    receiver: ::core::option::Option::Some(__deja_receiver),
+                },
+                __deja_args,
+                move || async move {
+                    self.$inner.#method_ident(#(#delegation_args),*).await
+                },
+                #reconstruct_closure,
+                move |__deja_result| { #result_json_expr },
+            ))
         }
     }
 }
@@ -426,29 +422,23 @@ fn generate_sync_method(
     } else {
         quote!(#existing_where_clause)
     };
-    let replay_attempt = if enable_replay {
+    // The reconstruct closure for the single `dispatch_with_hook` seam (sync
+    // analogue of the async method). Record-only → `|_| None` (unreachable, no
+    // serde bound); replay → deserialize the return type, `None` falls through.
+    let reconstruct_closure = if enable_replay {
         let return_type_for_replay = output_type_tokens(return_type);
         quote! {
-            // Attempt replay first.
-            if let Some(__deja_replay_json) = ::deja_record::DejaHook::try_replay_with_context(
-                &*self.$hook,
-                ::deja_record::ReplayLookup {
-                    boundary: $boundary,
-                    trait_name: #trait_name,
-                    method_name: #method_name_lit,
-                    args: &__deja_args,
-                    callsite_identity: ::core::option::Option::Some(&__deja_identity),
-                    caller_location: ::core::option::Option::Some(__deja_caller),
-                },
-            ) {
-                if let Ok(__deja_replayed) = ::serde_json::from_value::<#return_type_for_replay>(__deja_replay_json) {
-                    return __deja_replayed;
-                }
-                // Deserialization failed — fall through to real call.
+            |__deja_recorded: ::serde_json::Value| -> ::core::option::Option<#return_type_for_replay> {
+                ::serde_json::from_value::<#return_type_for_replay>(__deja_recorded).ok()
             }
         }
     } else {
-        quote!()
+        let return_type_for_replay = output_type_tokens(return_type);
+        quote! {
+            |_: ::serde_json::Value| -> ::core::option::Option<#return_type_for_replay> {
+                ::core::option::Option::None
+            }
+        }
     };
 
     quote! {
@@ -457,6 +447,10 @@ fn generate_sync_method(
         fn #method_ident #method_generics (#params) #return_type
         #where_clause
         {
+            // Fast path: skip all recording overhead when the hook is inactive
+            // (recording gate, not a replay-only operation). On the active path
+            // args are serialized eagerly so the seam call needs no borrowing
+            // thunk — matching the boxed-future constraint of the async sibling.
             if !::deja_record::DejaHook::is_active(&*self.$hook) {
                 return self.$inner.#method_ident(#(#delegation_args),*);
             }
@@ -469,8 +463,8 @@ fn generate_sync_method(
             });
             let __deja_args = #args_json;
 
-            // Build CallsiteIdentity (used by replay lookup and event recording).
-            // See the async method for the rationale; same rank-3/4 scheme.
+            // Build CallsiteIdentity ONCE (occurrence allocated once, reused by the
+            // seam for the lookup and the recorded event). Same rank-3/4 scheme.
             let __deja_correlation_id_for_identity = ::deja_context::current_correlation_id();
             let __deja_identity_scope_string = format!("{}::{}", #trait_name, #method_name_lit);
             let __deja_identity_scope = ::core::option::Option::Some(__deja_identity_scope_string.as_str());
@@ -491,21 +485,23 @@ fn generate_sync_method(
                 logical_context: ::deja_record::current_logical_span_path(),
             };
 
-            #replay_attempt
-
-            let __deja_builder = ::deja_record::EventBuilder::start_with_receiver(
-                &*self.$hook,
-                $boundary,
-                #trait_name,
-                #method_name_lit,
-                __deja_caller,
-                ::core::option::Option::Some(__deja_receiver),
+            // ONE seam: the former execute / replay / record arms collapse into a
+            // single call that owns all control flow. Names NO replay-only op.
+            ::deja_record::dispatch_with_hook(
+                ::deja_record::DelegateObservation {
+                    hook: &*self.$hook,
+                    boundary: $boundary,
+                    trait_name: #trait_name,
+                    method_name: #method_name_lit,
+                    caller: __deja_caller,
+                    identity: __deja_identity,
+                    receiver: ::core::option::Option::Some(__deja_receiver),
+                },
                 __deja_args,
-            ).with_callsite_identity(__deja_identity);
-            let __deja_result = self.$inner.#method_ident(#(#delegation_args),*);
-            let (__deja_result_json, __deja_is_err) = #result_json_expr;
-            __deja_builder.finish(&*self.$hook, __deja_result_json, __deja_is_err);
-            __deja_result
+                || self.$inner.#method_ident(#(#delegation_args),*),
+                #reconstruct_closure,
+                |__deja_result| { #result_json_expr },
+            )
         }
     }
 }

@@ -25,6 +25,7 @@
 //!   STRIPE_API_KEY       forwarded to the record workload (steps 7 & 9)
 
 use std::io::BufRead;
+use std::net::TcpListener;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,6 +36,7 @@ pub mod store_ctx;
 pub use store_ctx::StoreCtx;
 
 /// Resolved runtime configuration for the demo orchestration.
+#[derive(Clone)]
 struct Demo {
     compose_base: String,
     compose_overlay: String,
@@ -108,6 +110,64 @@ impl Demo {
             ),
         ]
     }
+
+    /// Derive a PER-RUN-ISOLATED clone of this config for a REPLAY run, so many
+    /// candidates can replay the ONE shared recording concurrently without
+    /// colliding on the docker project (→ its pg/redis/superposition/replay
+    /// stack) or the host replay port.
+    ///
+    /// - project  → `deja-run-<last 8 alnum of run_id>`: a distinct compose
+    ///   project. The LOW-order (fast-changing) end of the id is used — run ids
+    ///   are `run-<nanos_hex>`, whose HIGH digits barely move between runs
+    ///   submitted seconds apart, so taking the TAIL avoids project-name
+    ///   collisions for near-simultaneous parallel submissions. A distinct
+    ///   project means `up` brings up a distinct stack:
+    ///   an OWN pg + redis-standalone + migration_runner + superposition(+init)
+    ///   + hyperswitch-replay — a fresh, migrated DB + empty redis per run. The
+    ///   shared deja-demo project (record-side: kafka0, vector, minio, the
+    ///   recording) is untouched.
+    /// - replay_port → a free host TCP port (bind :0 to claim one): the only
+    ///   host-published port the replay stack exposes, hit by the host kernel.
+    ///
+    /// Record runs do NOT call this — they keep the shared project + MinIO so the
+    /// recording lands in the one shared bucket the orchestrator pulls from.
+    ///
+    /// Opt out (force the legacy shared project/port, e.g. for a strictly
+    /// sequential single-run debug) with `DEMO_REPLAY_SHARED=1`.
+    fn isolated_for_replay(&self, run_id: &str) -> Self {
+        if std::env::var("DEMO_REPLAY_SHARED").is_ok() {
+            return self.clone();
+        }
+        // Take the TAIL of the alphanumeric id (the low-order, fast-changing
+        // nanos hex), not the head — see the doc comment. Reverse, take 8, unreverse.
+        let alnum: Vec<char> = run_id.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        let short: String = if alnum.is_empty() {
+            "run".to_owned()
+        } else {
+            let start = alnum.len().saturating_sub(8);
+            alnum[start..].iter().collect()
+        };
+        let mut out = self.clone();
+        out.project = format!("deja-run-{short}");
+        out.replay_port = alloc_free_port().unwrap_or(self.replay_port);
+        eprintln!(
+            "lifecycle: replay run {run_id} isolated → project={} replay_port={}",
+            out.project, out.replay_port
+        );
+        out
+    }
+}
+
+/// Claim a free host TCP port by binding `:0` and reading back the OS-assigned
+/// port, then releasing it. There is an inherent (small) TOCTOU window between
+/// release and the container's `-p <port>:8080` bind; per-run ports drawn this
+/// way are spread across the ephemeral range so concurrent replays rarely
+/// collide, and a bind failure surfaces as a normal compose-up error.
+fn alloc_free_port() -> Option<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").ok()?;
+    let port = listener.local_addr().ok()?.port();
+    drop(listener);
+    Some(port)
 }
 
 /// Entry point spawned by the run-creation handler on a background thread.
@@ -128,7 +188,18 @@ pub fn drive(root: &HarnessRoot, run_id: &str, ctx: &StoreCtx) {
     }
     let outcome = match run.spec.mode {
         RunMode::Record => drive_record(root, &demo, &mut run, ctx),
-        RunMode::Replay => drive_replay(root, &demo, &mut run, ctx),
+        RunMode::Replay => {
+            // Per-run isolation: a replay run gets its OWN docker compose project
+            // (→ own pg/redis/superposition/replay stack) and its OWN host replay
+            // port, so N candidates can replay the shared recording in parallel.
+            let demo = demo.isolated_for_replay(run_id);
+            let result = drive_replay(root, &demo, &mut run, ctx);
+            // Tear the per-run stack down so parallel runs never leak ~5-container
+            // stacks. Only for an ISOLATED project (never the shared deja-demo,
+            // which holds the record-side recording other runs still pull).
+            teardown_if_isolated(&demo, run_id);
+            result
+        }
     };
     match outcome {
         Ok(()) => {
@@ -372,6 +443,7 @@ fn drive_record(
         &run.run_id,
         &["kafka0", "minio", "minio-setup"],
         run.candidate_image.is_none(),
+        &[],
     )?;
 
     set_stage(
@@ -400,6 +472,7 @@ fn drive_record(
         &run.run_id,
         &["vector", "hyperswitch-server"],
         run.candidate_image.is_none(),
+        &[],
     )?;
     set_status(root, run, RunStatus::Running, None);
     ctx.run_state("running");
@@ -418,6 +491,17 @@ fn drive_record(
         4,
         total,
         "driving payment workload (HS → Kafka → Vector → MinIO)",
+    );
+    // EU-settlement demo: the settlement READ is now a RAW fred GET against
+    // redis, so seed the default rate in the record container's redis (not pg)
+    // BEFORE the workload — V1 then records reading 0.10 and writing it (the
+    // recorded twin). Best-effort.
+    seed_redis(
+        demo,
+        &recording_id,
+        &run.run_id,
+        "settlement_rate_default",
+        "0.10",
     );
     run_workload(demo, ctx, &recording_id, run_iterations(run))?;
 
@@ -541,6 +625,21 @@ fn drive_replay(
         total,
         "starting replay router (DEJA_MODE=replay)",
     );
+    let deja_policy = run
+        .spec
+        .deja_policy
+        .clone()
+        .unwrap_or_else(|| "AllLookup".to_string());
+    // Op-scope for execute mode, forwarded to the replay container exactly like
+    // DEJA_POLICY. Only affects SelectiveExecute (AllLookup ignores execute_mode);
+    // empty/unset => the original "all State executes" behavior.
+    let deja_execute_ops = std::env::var("DEJA_EXECUTE_OPS").unwrap_or_default();
+    // `--build` defaults on for the legacy compose-build candidate (no baked
+    // image). For PARALLEL replays this is a hazard: every per-run project would
+    // concurrently rebuild the SAME `deja-router-local:latest` tag, racing the
+    // build cache. The parallel runner builds the replay image ONCE up front and
+    // sets DEMO_REPLAY_NO_BUILD=1, so isolated runs reuse it instead of rebuilding.
+    let build = run.candidate_image.is_none() && std::env::var("DEMO_REPLAY_NO_BUILD").is_err();
     compose_up(
         demo,
         ctx,
@@ -548,7 +647,11 @@ fn drive_replay(
         &recording_id,
         &run.run_id,
         &["hyperswitch-replay"],
-        run.candidate_image.is_none(),
+        build,
+        &[
+            ("DEJA_POLICY", deja_policy),
+            ("DEJA_EXECUTE_OPS", deja_execute_ops),
+        ],
     )?;
 
     set_status(root, run, RunStatus::Running, None);
@@ -573,6 +676,18 @@ fn drive_replay(
     // short-circuits → "merchant already exists" / UR_15). The in-memory moka cache
     // is already fresh per replay process; only redis carries record's writes over.
     flush_redis(demo, &recording_id, &run.run_id)?;
+    // GENERAL SEEDING (total-derivative precondition materialization). flush_redis
+    // just wiped redis, so the State (redis) keys the recorded correlations READ
+    // must be re-materialized BEFORE run_kernel, or a re-executed read either
+    // misses or reads stale. The SeedPlan is DERIVED from the recording's
+    // read-set + recorded results (the `settlement_rate_default` 0.10 the record
+    // run observed) and merged with a static ambient template (the
+    // `settlement_rate_premium` 0.20 the divergent re-keyed read reaches for) —
+    // replacing the hand-coded `redis-cli SET settlement_rate_*` literals. The
+    // candidate's re-keyed READ then executes the REAL read under
+    // SelectiveExecute and observes the divergent 0.20, while
+    // SelectiveExecute(self)/AllLookup still see the recorded 0.10. Best-effort.
+    materialize_seed_plan(demo, root, &recording_id, &run.run_id);
     run_kernel(demo, root, ctx, &recording_id, &run.run_id)?;
 
     set_stage(root, run, ctx, 6, total, "scoring divergence (byte-exact)");
@@ -661,6 +776,7 @@ fn compose_up(
     run_id: &str,
     services: &[&str],
     build: bool,
+    extra_env: &[(&str, String)],
 ) -> Result<(), String> {
     let mut args = demo.compose_base_args();
     args.extend(["up".into(), "-d".into()]);
@@ -675,11 +791,40 @@ fn compose_up(
     ctx.log(stage, &cmdline);
     let mut cmd = Command::new("docker");
     cmd.args(&args).envs(demo.compose_env(recording_id, run_id));
+    cmd.envs(extra_env.iter().map(|(k, v)| (k.to_string(), v.clone())));
     let status = run_streamed(cmd, ctx, stage, "docker compose up")?;
     if !status.success() {
         return Err(format!("docker compose up failed (status {status})"));
     }
     Ok(())
+}
+
+/// Tear down a PER-RUN-ISOLATED replay project with `docker compose down -v`
+/// (drop containers + the named volumes = its pg/redis data), so concurrent
+/// replays don't leak stacks. A no-op when the project is the shared `deja-demo`
+/// (the record-side project that holds the recording + MinIO other runs pull
+/// from — only the one-click script tears THAT down). Best-effort: a teardown
+/// failure is logged, never fatal (the verdict already stands).
+fn teardown_if_isolated(demo: &Demo, run_id: &str) {
+    if !demo.project.starts_with("deja-run-") {
+        return; // shared project — leave it for the owning script's teardown
+    }
+    let mut args = demo.compose_base_args();
+    args.extend(["down".into(), "-v".into(), "--remove-orphans".into()]);
+    eprintln!("lifecycle: tearing down isolated replay project {}", demo.project);
+    match Command::new("docker")
+        .args(&args)
+        .envs(demo.compose_env(run_id, run_id))
+        .output()
+    {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => eprintln!(
+            "lifecycle: down {} failed (continuing): {}",
+            demo.project,
+            String::from_utf8_lossy(&o.stderr)
+        ),
+        Err(e) => eprintln!("lifecycle: down {} failed (continuing): {e}", demo.project),
+    }
 }
 
 /// `docker compose exec -T redis-standalone redis-cli FLUSHALL` — wipe the
@@ -711,6 +856,164 @@ fn flush_redis(demo: &Demo, recording_id: &str, run_id: &str) -> Result<(), Stri
             Ok(())
         }
     }
+}
+
+/// Seed a single redis key the EU-settlement demo reads. The settlement READ is
+/// now a RAW fred GET (leaf boundary) against redis, so the seed lives in redis,
+/// not pg. Mirrors `flush_redis`'s `docker compose exec -T redis-standalone
+/// redis-cli ...` pattern. Best-effort: a failure logs and continues.
+fn seed_redis(demo: &Demo, recording_id: &str, run_id: &str, key: &str, value: &str) {
+    let mut args = demo.compose_base_args();
+    args.extend(
+        ["exec", "-T", "redis-standalone", "redis-cli", "SET", key, value]
+            .iter()
+            .map(|s| s.to_string()),
+    );
+    eprintln!("lifecycle: docker {}", args.join(" "));
+    match Command::new("docker")
+        .args(&args)
+        .envs(demo.compose_env(recording_id, run_id))
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            eprintln!("lifecycle: seed_redis exited {status}; continuing (best-effort)");
+        }
+        Err(e) => {
+            eprintln!("lifecycle: could not run seed_redis: {e}; continuing (best-effort)");
+        }
+    }
+}
+
+/// Build the total-derivative [`SeedPlan`](deja::SeedPlan) from the recording
+/// and materialize every redis precondition into the (just-flushed) replay
+/// store via [`seed_redis`].
+///
+/// This GENERALIZES the old hand-coded `redis-cli SET settlement_rate_*` seeds:
+/// instead of literal keys, the preconditions are DERIVED from the recording's
+/// read-set + recorded results (one [`build_seed_plan`](deja::build_seed_plan)
+/// per correlation, unioned across the tape), then merged with a static ambient
+/// template (config keys a re-keyed/diverged read reaches for). The pure plan
+/// logic lives in `deja-record` and is unit-tested without docker; this function
+/// is the thin I/O wiring that walks the plan and shells `seed_redis` per entry.
+///
+/// Best-effort throughout: a missing/unparseable recording or an unreachable
+/// redis logs and continues rather than failing the replay (matching the prior
+/// hand-coded seeds' best-effort behavior).
+fn materialize_seed_plan(demo: &Demo, root: &HarnessRoot, recording_id: &str, run_id: &str) {
+    let recording_path = root.recording_events_path(recording_id);
+    let events = read_recording_events(&recording_path);
+    // Union one per-correlation plan across every distinct correlation on the
+    // tape (each request is an independent test case). Keyed by (boundary, key),
+    // so identical preconditions across cases dedupe.
+    let mut correlations: Vec<Option<String>> = events
+        .iter()
+        .map(|e| e.correlation_id.clone())
+        .collect();
+    correlations.sort();
+    correlations.dedup();
+    let mut plan = deja::SeedPlan::new();
+    for corr in &correlations {
+        let case_plan = deja::build_seed_plan(&events, corr.as_deref());
+        for entry in case_plan.iter() {
+            plan.upsert(entry.clone());
+        }
+    }
+    // Merge the static ambient/config template (deliverable 4): config keys the
+    // recording never observed (e.g. `settlement_rate_premium`) but that a
+    // diverged read reaches for. Ambient never clobbers a recording-derived
+    // precondition.
+    let plan = plan.with_ambient(&load_ambient_template());
+
+    if plan.is_empty() {
+        eprintln!(
+            "lifecycle: seed plan is empty for recording {recording_id} \
+             (no State reads + empty ambient template); nothing to materialize"
+        );
+        return;
+    }
+    eprintln!(
+        "lifecycle: materializing seed plan ({} preconditions) for recording {recording_id}",
+        plan.len()
+    );
+    for entry in plan.iter() {
+        // Only the redis State channel is materialized here (the db/storage
+        // channel seeds via its own template-clone path, out of scope for this
+        // wiring). Render the value to the raw string redis holds: a JSON string
+        // becomes its inner text (so "0.20" not "\"0.20\""), everything else its
+        // compact JSON.
+        if entry.boundary != "redis" {
+            continue;
+        }
+        let value = render_redis_seed_value(&entry.value);
+        seed_redis(demo, recording_id, run_id, &entry.key, &value);
+    }
+}
+
+/// Render a seed value to the raw string redis holds: a JSON string becomes its
+/// inner text (so `"0.20"` materializes as `0.20`, byte-identical to the old
+/// literal `redis-cli SET ... 0.20`); any other JSON becomes its compact form.
+fn render_redis_seed_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Read a recording's events JSONL, tolerating non-event lines (headers from a
+/// mixed stream) exactly like the lookup renderer does. Returns an empty vec on
+/// any I/O failure (best-effort seeding).
+fn read_recording_events(path: &std::path::Path) -> Vec<deja::SemanticEvent> {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(path) else {
+        eprintln!(
+            "lifecycle: seed plan: recording {} not readable; skipping seeding",
+            path.display()
+        );
+        return Vec::new();
+    };
+    let reader = std::io::BufReader::new(file);
+    let mut events = Vec::new();
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(ev) = serde_json::from_str::<deja::SemanticEvent>(&line) {
+            events.push(ev);
+        }
+    }
+    events
+}
+
+/// Load the ambient/config template for seed materialization (deliverable 4).
+///
+/// If `DEJA_AMBIENT_TEMPLATE` points at a `boundary\tkey\tvalue` TSV file, it is
+/// parsed from there; otherwise the built-in EU-settlement
+/// [`demo_defaults`](deja::AmbientTemplate::demo_defaults) supply the premium
+/// rate — replacing the hand-coded `redis-cli SET settlement_rate_premium 0.20`.
+fn load_ambient_template() -> deja::AmbientTemplate {
+    if let Ok(path) = std::env::var("DEJA_AMBIENT_TEMPLATE") {
+        if !path.trim().is_empty() {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    let template = deja::AmbientTemplate::from_tsv(&text);
+                    eprintln!(
+                        "lifecycle: loaded ambient template from {path} ({} entries)",
+                        template.entries().len()
+                    );
+                    return template;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "lifecycle: could not read DEJA_AMBIENT_TEMPLATE={path}: {e}; \
+                         falling back to demo defaults"
+                    );
+                }
+            }
+        }
+    }
+    deja::AmbientTemplate::demo_defaults()
 }
 
 fn run_workload(
@@ -1035,6 +1338,7 @@ fn pull_recording(root: &HarnessRoot, ctx: &StoreCtx, recording_id: &str) -> Res
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests panic on failure by design
 mod tests {
     use super::*;
     use crate::{CandidateSpec, RunSpec};
@@ -1046,6 +1350,7 @@ mod tests {
                 mode: RunMode::Record,
                 candidate_spec: CandidateSpec::PrebuiltImage { image: "x".into() },
                 recording_id: None,
+                deja_policy: None,
                 workload,
             },
             status: RunStatus::Pending,
@@ -1069,6 +1374,102 @@ mod tests {
         assert_eq!(
             run_iterations(&run_with_workload(serde_json::json!({ "iterations": 25 }))),
             25
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Seed-plan materialization wiring (deliverable 5) — the docker `seed_redis`
+    // shell is not exercised; the plan-build + ambient-merge + value-rendering
+    // pipeline that drives it is.
+    // -----------------------------------------------------------------------
+
+    /// A minimal recorded State READ event as JSONL (uses serde defaults for the
+    /// many additive fields, so the test only states what it cares about).
+    fn settlement_read_event_jsonl(correlation: &str, key: &str, value: &str) -> String {
+        serde_json::json!({
+            "global_sequence": 0,
+            "request_sequence": 0,
+            "correlation_id": correlation,
+            "timestamp_ns": 0,
+            "boundary": "redis",
+            "trait_name": "RedisStore",
+            "method_name": "get",
+            "call_file": "x.rs",
+            "call_line": 1,
+            "call_column": 1,
+            "args": [key],
+            "result": value,
+            "is_error": false,
+            "duration_us": 0,
+            "read_set": [key]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn read_recording_events_tolerates_non_event_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let body = format!(
+            "{}\n# a header / non-event line\n\n{}\n",
+            settlement_read_event_jsonl("c1", "settlement_rate_default", "0.10"),
+            "{not json at all}"
+        );
+        std::fs::write(&path, body).unwrap();
+        let events = read_recording_events(&path);
+        assert_eq!(events.len(), 1, "only the one valid event parses");
+        assert_eq!(events[0].read_set, vec!["settlement_rate_default"]);
+    }
+
+    /// The full replay-side wiring: derive the default rate from the recording's
+    /// read-set, supply the premium rate from the ambient template, and render
+    /// both to the byte-identical redis values the old hand-coded seeds wrote.
+    #[test]
+    fn seed_plan_yields_settlement_rates_from_recording_and_template() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        std::fs::write(
+            &path,
+            settlement_read_event_jsonl("c1", "settlement_rate_default", "0.10"),
+        )
+        .unwrap();
+        let events = read_recording_events(&path);
+
+        // Build the plan exactly as materialize_seed_plan does (per-correlation,
+        // unioned, then ambient-merged).
+        let mut plan = deja::SeedPlan::new();
+        for entry in deja::build_seed_plan(&events, Some("c1")).iter() {
+            plan.upsert(entry.clone());
+        }
+        let plan = plan.with_ambient(&deja::AmbientTemplate::demo_defaults());
+
+        // default rate is RECORDING-derived; premium rate is AMBIENT-derived.
+        let default = plan
+            .resolve("redis", "settlement_rate_default")
+            .expect("default seeded from recording");
+        assert_eq!(default.origin, deja::SeedOrigin::Recording);
+        assert_eq!(render_redis_seed_value(&default.value), "0.10");
+
+        let premium = plan
+            .resolve("redis", "settlement_rate_premium")
+            .expect("premium seeded from ambient template");
+        assert_eq!(premium.origin, deja::SeedOrigin::Ambient);
+        assert_eq!(
+            render_redis_seed_value(&premium.value),
+            "0.20",
+            "premium rate renders byte-identically to the old `redis-cli SET ... 0.20`"
+        );
+    }
+
+    #[test]
+    fn ambient_template_defaults_to_demo_premium_rate() {
+        // No DEJA_AMBIENT_TEMPLATE set in test → demo defaults.
+        let template = load_ambient_template();
+        assert!(!template.is_empty());
+        let plan = deja::SeedPlan::new().with_ambient(&template);
+        assert_eq!(
+            render_redis_seed_value(&plan.resolve("redis", "settlement_rate_premium").unwrap().value),
+            "0.20"
         );
     }
 }

@@ -161,6 +161,20 @@ a:hover { color: var(--accent-hover); text-decoration: underline; }
 .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: var(--s3); }
 .metric .v { font-size: var(--fs-19); font-weight: 600; font-variant-numeric: tabular-nums; }
 .metric .k { color: var(--text-subtle); font-size: var(--fs-11); margin-top: 2px; }
+/* the headline total-derivative catch — a non-zero value_divergences metric */
+.metric.hot { background: rgba(248,81,73,0.10); border: 1px solid var(--diff-del-edge); border-radius: var(--r-sm); padding: var(--s2) var(--s3); margin: calc(var(--s2) * -1) calc(var(--s3) * -1); }
+.metric.hot .v { color: var(--red-fg); }
+.metric.hot .k { color: var(--red-fg); }
+
+/* ---- catch banner (SelectiveExecute total-derivative headline) ---- */
+.catchbanner {
+  display: flex; align-items: flex-start; gap: var(--s3);
+  background: rgba(248,81,73,0.10); border: 1px solid var(--diff-del-edge);
+  border-left: 3px solid var(--diff-del-edge); border-radius: var(--r-md);
+  padding: var(--s3) var(--s4); margin-bottom: var(--s4);
+}
+.catchbanner-body { display: grid; gap: 4px; }
+.catchbanner-body strong { color: var(--red-fg); font-size: var(--fs-15); }
 
 /* ---- forms ---- */
 form.runform { display: grid; gap: var(--s3); max-width: 720px; }

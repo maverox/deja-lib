@@ -9,7 +9,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::task::{Context, Poll};
 
 use pin_project_lite::pin_project;
@@ -93,6 +94,80 @@ pub fn capture_current() -> ContextSnapshot {
     ContextSnapshot {
         correlation_id: current_correlation_id(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-request recording decision registry (the sampling gate)
+// ---------------------------------------------------------------------------
+
+/// Stays `false` until a sampler first pushes a decision. The common path — no
+/// sampler installed (e.g. the demo / matrix) — then pays a single relaxed
+/// atomic load and never locks the registry, so recording behaves exactly as it
+/// did before sampling existed.
+static SAMPLER_ENGAGED: AtomicBool = AtomicBool::new(false);
+
+/// `correlation_id -> record?`, populated at ingress by the host's sampler
+/// (e.g. Hyperswitch resolving `deja_record_enabled` from Superposition). Keyed
+/// by correlation id, so every task sharing the correlation — including spawned
+/// tasks — resolves the same decision with no extra propagation.
+// A read-mostly `RwLock`, not a `Mutex`: the hot path is the per-boundary READ
+// (`recording_decision_for_current`), which takes a shared read lock that never
+// contends with other readers; writes happen only at ingress/teardown. Combined
+// with the `SAMPLER_ENGAGED` fast-path, an un-sampled process touches neither.
+static RECORD_DECISIONS: OnceLock<RwLock<HashMap<String, bool>>> = OnceLock::new();
+
+fn record_decisions() -> &'static RwLock<HashMap<String, bool>> {
+    RECORD_DECISIONS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Push the per-request recording decision for `correlation_id`.
+///
+/// The host decides *whether* to record (rate, targeting, experiments — all
+/// server-side in Superposition) and pushes the resolved boolean here at
+/// ingress. Déjà only consumes it: `false` makes the recording hook a no-op for
+/// every boundary on this correlation (gate-before-allocation); `true` records
+/// as usual. With no decision the gate defaults to recording, so a host that
+/// never installs a sampler is unaffected.
+pub fn set_recording_decision(correlation_id: impl Into<String>, record: bool) {
+    SAMPLER_ENGAGED.store(true, Ordering::Relaxed);
+    if let Ok(mut map) = record_decisions().write() {
+        map.insert(correlation_id.into(), record);
+    }
+}
+
+/// Drop the decision for `correlation_id` (call at request teardown to bound the
+/// registry).
+pub fn clear_recording_decision(correlation_id: &str) {
+    if SAMPLER_ENGAGED.load(Ordering::Relaxed) {
+        if let Ok(mut map) = record_decisions().write() {
+            map.remove(correlation_id);
+        }
+    }
+}
+
+/// The decision for an explicit `correlation_id`, or `None` if no sampler is
+/// engaged or none was set.
+pub fn recording_decision(correlation_id: &str) -> Option<bool> {
+    if !SAMPLER_ENGAGED.load(Ordering::Relaxed) {
+        return None;
+    }
+    record_decisions()
+        .read()
+        .ok()
+        .and_then(|map| map.get(correlation_id).copied())
+}
+
+/// The decision for the current correlation, or `None` when no sampler is
+/// engaged or the current correlation has none.
+///
+/// Hot-path gate: `recording_decision_for_current().unwrap_or(true)` — record by
+/// default, suppress only on an explicit `false`.
+pub fn recording_decision_for_current() -> Option<bool> {
+    if !SAMPLER_ENGAGED.load(Ordering::Relaxed) {
+        return None;
+    }
+    let correlation_id = current_correlation_id()?;
+    recording_decision(&correlation_id)
 }
 
 /// Enter a context for the lifetime of the returned guard.
@@ -243,5 +318,31 @@ mod tests {
             assert_eq!(current_correlation_id().as_deref(), Some("req-1"));
         }
         assert_eq!(current_correlation_id(), None);
+    }
+
+    #[test]
+    fn sampling_gate_push_resolve_and_clear() {
+        // Pushing a decision engages the registry and records it per correlation.
+        set_recording_decision("req-off", false);
+        set_recording_decision("req-on", true);
+        assert_eq!(recording_decision("req-off"), Some(false));
+        assert_eq!(recording_decision("req-on"), Some(true));
+        // An unknown correlation has no decision → caller records by default.
+        assert_eq!(recording_decision("req-unknown-zzz"), None);
+
+        // The current-correlation resolver reads the ambient correlation id.
+        {
+            let _g = enter_correlation_id("req-off");
+            assert_eq!(recording_decision_for_current(), Some(false));
+        }
+        {
+            let _g = enter_correlation_id("req-on");
+            assert_eq!(recording_decision_for_current(), Some(true));
+        }
+
+        // Clearing bounds the registry; the gate then falls back to default.
+        clear_recording_decision("req-off");
+        assert_eq!(recording_decision("req-off"), None);
+        clear_recording_decision("req-on");
     }
 }

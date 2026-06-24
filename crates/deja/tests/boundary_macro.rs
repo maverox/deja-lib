@@ -301,4 +301,45 @@ fn boundary_macro_records_sync_function() {
         db_identity.lexical_path.is_some(),
         "db identity must carry a rank-3 lexical path"
     );
+
+    // DECLARATIVE BOUNDARY MODEL: the hand-written db seam now DECLARES its
+    // semantics. `select_one` is a State-channel op; `is_read_op("select_one")` is
+    // false (it is not a recognized read verb), so the declared effect is `Write`
+    // — byte-identical to the verdict the name heuristic produced. The declared
+    // channel/effect drive `read_set`/`write_set`: a Write seeds the write_set
+    // (and leaves read_set empty), exactly as the heuristic did.
+    assert_eq!(
+        events[9].channel,
+        Some(deja::Channel::State),
+        "db seam must declare Channel::State"
+    );
+    assert_eq!(
+        events[9].effect,
+        Some(deja::Effect::Write),
+        "db `select_one` declares Effect::Write (matches is_read_op's verdict)"
+    );
+    assert!(events[9].strategy.is_none(), "no RMW in the generic db seam");
+    assert!(
+        events[9].read_set.is_empty(),
+        "a declared db Write contributes no read_set"
+    );
+    assert!(
+        !events[9].write_set.is_empty(),
+        "a declared db Write seeds the write_set from the primary key"
+    );
+
+    // UNDECLARED FALLBACK: the `#[deja::boundary]` / `#[deja::redis]` events here
+    // declare NO semantics (the macro emits the legacy `BoundarySpec::new`), so
+    // their channel/effect stay `None` and `finish` falls back to the name
+    // heuristics — byte-identical to before this slice. The redis read here has an
+    // empty read_set because its args were `skip_all`'d (no captured key), exactly
+    // as before; the point under test is that the channel/effect are UNDECLARED.
+    assert!(
+        events[0].channel.is_none() && events[0].effect.is_none(),
+        "an undeclared unit boundary carries no declared channel/effect"
+    );
+    assert!(
+        events[7].channel.is_none() && events[7].effect.is_none(),
+        "an undeclared redis boundary falls back to the heuristic (no declaration)"
+    );
 }

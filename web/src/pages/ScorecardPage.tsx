@@ -6,6 +6,7 @@ import { ConfidenceBadge, ConfidenceLadder, overallConfidence } from "../compone
 export default function ScorecardPage() {
   const { runId = "" } = useParams();
   const card = useQuery({ queryKey: ["scorecard", runId], queryFn: () => api.scorecard(runId) });
+  const calls = useQuery({ queryKey: ["calls", runId], queryFn: () => api.calls(runId) });
 
   if (card.isLoading) return <p className="hint">loading…</p>;
   if (card.error || !card.data) return <p className="err">{String(card.error)}</p>;
@@ -13,6 +14,27 @@ export default function ScorecardPage() {
   const s = c.summary;
   const verdict = c.verdict.inconclusive ? "inconclusive" : c.verdict.pass ? "pass" : "fail";
   const conf = overallConfidence(s.resolved_by_rank ?? {});
+  const valueDivergences = s.value_divergences ?? 0;
+  const seedGaps = s.inconclusive_seed_gaps ?? 0;
+  const caught = valueDivergences > 0;
+  const boundaries = Object.entries(c.per_boundary ?? {});
+
+  // Total-derivative cascade: the value_diverged calls, grouped by correlation,
+  // ordered origin (read) first then consequences (writes), then by recorded seq.
+  const fmt = (v: unknown) => (typeof v === "string" ? v : v == null ? "∅" : JSON.stringify(v));
+  const cascades = new Map<string, typeof calls.data>();
+  for (const r of calls.data ?? []) {
+    if (r.kind !== "value_diverged") continue;
+    const key = r.correlation_id ?? "(uncorrelated)";
+    (cascades.get(key) ?? cascades.set(key, []).get(key)!)!.push(r);
+  }
+  for (const rows of cascades.values()) {
+    rows!.sort(
+      (a, b) =>
+        Number(!!b.origin) - Number(!!a.origin) ||
+        (a.source_event_global_sequence ?? 0) - (b.source_event_global_sequence ?? 0),
+    );
+  }
 
   return (
     <>
@@ -26,6 +48,65 @@ export default function ScorecardPage() {
         <span className={`chip solid ${verdict}`}>{verdict}</span>
         <ConfidenceBadge level={conf} title="overall run confidence = weakest address rank relied on" />
         <span className="lede">{c.verdict.reason}</span>
+      </div>
+
+      {caught && (
+        <div className="catchbanner">
+          <span className="chip solid fail">CAUGHT</span>
+          <div className="catchbanner-body">
+            <strong>
+              {valueDivergences} value divergence{valueDivergences === 1 ? "" : "s"} — total-derivative catch
+            </strong>
+            <span className="hint">
+              Under SelectiveExecute the candidate ran the real boundary and produced a value differing
+              from the recorded baseline at the same call-site. This is invisible to AllLookup (full-mock),
+              where the recorded result is always substituted.
+            </span>
+          </div>
+        </div>
+      )}
+
+      {cascades.size > 0 && (
+        <>
+          <h2>Total-derivative cascade</h2>
+          {[...cascades.entries()].map(([corr, rows]) => (
+            <div className="panel" key={corr} style={{ marginBottom: "var(--s3)" }}>
+              <div className="mono hint" style={{ marginBottom: "var(--s2)" }}>{corr}</div>
+              <div className="cascade">
+                {rows!.map((r, i) => (
+                  <div key={i} className="cascade-step" style={{ display: "flex", alignItems: "center", gap: "var(--s2)", marginBottom: 6 }}>
+                    <span className={`chip solid ${r.origin ? "fail" : "removed"}`}>
+                      {r.origin ? "ORIGIN" : "CONSEQUENCE"}
+                    </span>
+                    <span className="mono">{r.boundary}.{r.method_name}</span>
+                    <span className="diffval">
+                      <span className="chip removed">{fmt(r.recorded?.result)}</span>
+                      <span style={{ margin: "0 6px" }}>→</span>
+                      <span className="chip added">{fmt(r.observed?.result)}</span>
+                    </span>
+                    {i < rows!.length - 1 && <span className="hint">↓ flows to</span>}
+                  </div>
+                ))}
+              </div>
+              <p className="hint" style={{ marginTop: "var(--s2)" }}>
+                Causal link inferred at the boundary cut — dataflow BETWEEN boundaries is not traced.
+                The read (origin) and write (consequence) fire under the same span (boundary-only
+                granularity), so the order/edge is the inference, not a recorded edge.
+              </p>
+            </div>
+          ))}
+        </>
+      )}
+
+      <div className="panel grid">
+        <div className={`metric${caught ? " hot" : ""}`}>
+          <div className="v">{valueDivergences}</div>
+          <div className="k">value divergences (total-derivative catches)</div>
+        </div>
+        <div className="metric">
+          <div className="v">{seedGaps}</div>
+          <div className="k">inconclusive seed gaps</div>
+        </div>
       </div>
 
       <div className="panel grid">
@@ -45,6 +126,51 @@ export default function ScorecardPage() {
           UNMATCHED (positional) survived on ordering alone and is the fragility signal.
         </p>
       </div>
+
+      {boundaries.length > 0 && (
+        <>
+          <h2>Per-boundary channels</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>boundary</th>
+                <th>tier</th>
+                <th className="num">matched</th>
+                <th className="num">diverged</th>
+                <th>kinds</th>
+              </tr>
+            </thead>
+            <tbody>
+              {boundaries.map(([name, b]) => {
+                const kinds = Object.entries(b.kinds ?? {}).filter(([, n]) => n > 0);
+                return (
+                  <tr key={name}>
+                    <td className="mono">{name}</td>
+                    <td>{b.tier ?? "—"}</td>
+                    <td className="num">{b.matched ?? 0}</td>
+                    <td className="num">
+                      {b.diverged ? (
+                        <span className="chip fail">{b.diverged}</span>
+                      ) : (
+                        0
+                      )}
+                    </td>
+                    <td>
+                      {kinds.length === 0
+                        ? "—"
+                        : kinds.map(([k, n]) => (
+                            <span key={k} className="chip muted" style={{ marginRight: 4 }}>
+                              {k}: {n}
+                            </span>
+                          ))}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </>
+      )}
 
       {c.per_correlation && c.per_correlation.length > 0 && (
         <>
